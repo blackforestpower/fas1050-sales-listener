@@ -11,3 +11,6 @@ __pycache__/
 
 # Backups
 backups/
+
+# Token-Datei (alt)
+.telegram_token

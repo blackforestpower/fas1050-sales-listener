@@ -239,14 +239,12 @@ def parse_line(line):
         # ── Verkaufsstatus ─────────────────────────────────
         elif "selstate" in cmd:
             result["state"] = values[0] if values else "unknown"
-            # viewprice kann "viewprice 250" enthalten → Preis extrahieren
-            if "viewprice" in result["state"]:
-                parts = result["state"].split()
-                if len(parts) >= 2:
-                    try:
-                        result["viewprice_cent"] = int(parts[1])
-                    except ValueError:
-                        pass
+            # viewprice: Preis steht in values[1] (z.B. "viewprice 250")
+            if "viewprice" in result["state"] and len(values) >= 2:
+                try:
+                    result["viewprice_cent"] = int(values[1])
+                except ValueError:
+                    pass
 
         # ── Guthaben / Verkaufszähler ──────────────────────
         elif "readcredit" in cmd and len(values) >= 2:
@@ -762,10 +760,16 @@ def listen_forever():
             except socket.timeout:
                 # Normal: kein Data in diesem 1s-Fenster
                 idle_cycles += 1
+                # Automat sendet ca. alle 10s Temperatur-Daten.
+                # Wenn selbst 60s nix kommt, ist der Socket tot.
                 # Alle 60 Zyklen (~60s) einen Heartbeat-Log
-                # (damit wir sehen dass die Verbindung noch lebt)
                 if idle_cycles % 60 == 0:
                     log(f"💓 Heartbeat (verbunden seit id={idle_cycles//60} min)")
+                # Verbindung neu aufbauen wenn 60s keine Daten kamen
+                # (Socket kann "stumm sterben" ohne FIN/RST)
+                if idle_cycles >= 60:
+                    log(f"⏰ Keine Daten seit 60s - erzwinge Reconnect")
+                    break
                 continue
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 log(f"⚠️ Verbindungsfehler: {e}")
