@@ -69,13 +69,13 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 # ─── KONFIGURATION ────────────────────────────────────────────
-HOST = "192.168.200.146"         # IP des VaS 1050 Automaten
+HOST = "X.X.X.X"                  # IP des FAS 1050 Automaten (lokal anpassen!)
 PORT = 8888                       # TCP-Port (Management-Interface)
 RECONNECT_DELAY = 5               # Sekunden bis zum Wiederverbinden
 
 # ─── TELEGRAM ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_TRADING_GROUP = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "-5134447945")
+TELEGRAM_TRADING_GROUP = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = True
 
 # Fallback: Falls Environment-Variablen nicht gesetzt,
@@ -469,6 +469,9 @@ sale_is_card = False      # Wurde 4900 (Karte) gesehen?
 def telegram_send(text):
     """Sendet eine Nachricht an die Trading-Gruppe via Bot-API"""
     if not TELEGRAM_ENABLED:
+        return
+    if not TELEGRAM_TRADING_GROUP:
+        log("⚠️  Keine Telegram-Chat-ID konfiguriert – Nachricht nicht gesendet")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"

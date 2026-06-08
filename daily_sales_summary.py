@@ -23,7 +23,7 @@ CATALOG_FILE = os.path.join(DATA_DIR, "product_catalog.json")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "-5134447945")
+TELEGRAM_CHAT_ID = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "")
 if not TELEGRAM_BOT_TOKEN:
     token_file = os.path.join(SCRIPT_DIR, ".telegram_token")
     try:
@@ -34,8 +34,8 @@ if not TELEGRAM_BOT_TOKEN:
 
 
 def telegram_send(msg):
-    if not TELEGRAM_BOT_TOKEN:
-        print("⚠️  KEIN TELEGRAM_BOT_TOKEN", file=sys.stderr)
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️  KEIN TELEGRAM_BOT_TOKEN oder CHAT_ID", file=sys.stderr)
         return
     try:
         import urllib.request, urllib.parse
