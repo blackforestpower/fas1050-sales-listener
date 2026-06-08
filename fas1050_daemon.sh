@@ -14,4 +14,4 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-python3 -u camiro-automat-vas1050/fas1050_listener.py
+python3 -u camiro-automat-fas1050/fas1050_listener.py
