@@ -234,6 +234,14 @@ def parse_line(line):
         # ── Verkaufsstatus ─────────────────────────────────
         elif "selstate" in cmd:
             result["state"] = values[0] if values else "unknown"
+            # viewprice kann "viewprice 250" enthalten → Preis extrahieren
+            if "viewprice" in result["state"]:
+                parts = result["state"].split()
+                if len(parts) >= 2:
+                    try:
+                        result["viewprice_cent"] = int(parts[1])
+                    except ValueError:
+                        pass
 
         # ── Guthaben / Verkaufszähler ──────────────────────
         elif "readcredit" in cmd and len(values) >= 2:
@@ -425,16 +433,23 @@ def save_event(state, event_type="state_change", event_data=None):
 #  SALES DETECTION + TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 #
-# LOGIK (v3 - 07.06.2026):
+# LOGIK (v4 - 08.06.2026):
 # ─────────────────────────
-# Ein VERKAUF wird nur erkannt wenn:
-#   (A) select → viewprice → busy → erog lock → entnahme → enderog
-#   (B) Der PREIS kommt aus viewprice, NICHT aus Kredit-Differenz!
+# Es gibt zwei völlig unterschiedliche Zahlungsprozesse:
 #
-# Kredit-Verhalten:
-#   - Bargeld: Kredit steigt beim Einwerfen, sinkt beim Verkauf
-#   - Karte: Kredit wird auf XX.00€ gesetzt, bleibt, wird auf 0 gesetzt
-#   → Kredit-Differenz ist unzuverlässig. viewprice ist die Quelle!
+# 💳 KARTE (Kredit = 4900 = 49,00€ Reserve)
+#   select → (viewprice optional) → readcredit 4900 → select → erog → readcredit 0 → take
+#   - 4900 = Kartenterminal-Reserve, NICHT der Preis!
+#   - Preis kommt aus Slot-Preis-Tabelle
+#   - viewprice kann erscheinen (Display), wird aber nicht für Preis genutzt
+#   - Direkt von 4900 auf 0, kein Kredit-Verlauf
+#
+# 💵 CASH (Kredit = eingeworfener Geldbetrag)
+#   select → viewprice → readcredit X (mehrere, steigend) → select → erog
+#   → readcredit Y (sinkt) → readcredit 0 → take
+#   - Preis kommt AUSSCHLIESSLICH aus viewprice!
+#   - Kredit-Verlauf: Einwurf (z.B. 500) → Abzug (250) → Rückgeld (0)
+#   - Der Kredit-Vorher (credit_before) ist der eingeworfene Betrag
 #
 # Slot aus select <rack> <slot>  →  Anzeige: <rack><slot> (Bsp: 0:35 = 035 = 35)
 # ═══════════════════════════════════════════════════════════════
@@ -445,10 +460,9 @@ sale_price_cent = 0       # Preis aus viewprice
 current_sale_slot = None
 last_erog_time = 0        # epoch seconds
 
-# Kredit-Vergleich für readcredit-Fallback
+# Für Preisermittlung bei erog / take
 sale_credit_before = 0    # Kredit-Wert bei erog
-sale_credit_after = 0     # Kredit-Wert bei take/enderog
-sale_viewprice_confirmed = False  # Wurde viewprice in diesem Verkauf gesehen?
+sale_is_card = False      # Wurde 4900 (Karte) gesehen?
 
 
 def telegram_send(text):
@@ -472,11 +486,14 @@ def telegram_send(text):
 def detect_sale(line, parsed, state):
     """
     Erkennt VERKÄUFE anhand der Protokoll-Sequenz.
-    Preis aus viewprice, Slot aus select, Auslöser = erog+
+    
+    Zwei Prozesse:
+    💳 KARTE (credit_before = 4900) → Preis aus Slot-Tabelle
+    💵 CASH (credit_before < 4900) → Preis aus viewprice
     """
     global last_credit_count, sale_in_progress, sale_price_cent
     global current_sale_slot, last_erog_time
-    global sale_credit_before, sale_credit_after, sale_viewprice_confirmed
+    global sale_credit_before, sale_is_card
 
     now = datetime.now()
 
@@ -489,24 +506,29 @@ def detect_sale(line, parsed, state):
             rack = int(parts[1])
             slot_num = int(parts[2])
             current_sale_slot = str(rack * 100 + slot_num)
-            # NICHT loggen bei jedem select (kann mehrfach kommen)
+            # viewprice zurücksetzen (neue Auswahl)
+            sale_price_cent = 0
 
-    # ── viewprice: Preis merken ───────────────────────────
-    if cmd == "selstate":
+    # ── viewprice: Preis merken (NUR bei Cash relevant) ──
+    if "selstate" in cmd:
         new_state = parsed.get("state", "")
 
         if new_state.startswith("viewprice"):
-            vals = parsed.get("values", [])
-            if vals:
-                try:
-                    price_in_view = int(vals[0])
-                    if 1 <= price_in_view <= 1000:
-                        sale_price_cent = price_in_view
-                        # Wenn wir in einem Verkauf sind, Preis bestätigen
-                        if sale_in_progress:
-                            sale_viewprice_confirmed = True
-                except (ValueError, IndexError):
-                    pass
+            # viewprice-Preis kommt jetzt korrekt aus dem Parser
+            vp = parsed.get("viewprice_cent", 0)
+            if vp and 1 <= vp <= 10000:
+                sale_price_cent = vp
+
+    # ── readcredit 4900 = Karte erkannt ───────────────
+    if "readcredit" in cmd:
+        cu = parsed.get("credit_units", 0)
+        if cu == 4900 and not sale_in_progress:
+            sale_is_card = True
+            log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
+
+    # ── selstate Continue für erog/take ─────────────────
+    if "selstate" in cmd:
+        new_state = parsed.get("state", "")
 
         # 🔥 Echter Verkauf: erog = Ausgabe läuft!
         if new_state.startswith("erog"):
@@ -514,72 +536,63 @@ def detect_sale(line, parsed, state):
                 last_erog_time = time.time()
                 if not sale_in_progress:
                     sale_in_progress = True
-                    sale_viewprice_confirmed = False
                     
-                    # Preis aus viewprice-Event (beim line-Parsing) oder state
-                    if not sale_price_cent or sale_price_cent <= 0:
-                        st_str = state.get("selstate", "")
-                        # state: "viewprice" oder "busy" o.ä.
-                        # In manchen Fällen steht der viewprice im state
-                        if "viewprice" in st_str:
-                            parts = st_str.split()
-                            for p in parts:
-                                try:
-                                    pv = int(p)
-                                    if 1 <= pv <= 1000:
-                                        sale_price_cent = pv
-                                        break
-                                except ValueError:
-                                    pass
-                    
-                    # Kredit-Vorher: LIVE aus AUSGANGS-Kredit des Automaten
-                    # Bei Kartenzahlung: Kredit 4900 → 0 (das ist Reserve, nicht Preis!)
-                    # Bei Bargeld: Kredit 100 → 0 oder so
+                    # Kredit-Vorher: LIVE aus aktuellen Automaten-Daten
                     credit = state.get("credit", {})
                     sale_credit_before = credit.get("units", 0) or 0
+                    sale_is_card = (sale_credit_before == 4900)
                     
                     log(f"🛒  VERKAUF ({current_sale_slot or '?'}) | "
                         f"viewprice={sale_price_cent or '?'} Cent | "
-                        f"credit_before={sale_credit_before}")
+                        f"credit_before={sale_credit_before} | "
+                        f"{'💳 Karte' if sale_is_card else '💵 Cash'}")
 
-        # 🔚 Verkauf abgeschlossen: take unlock ODER enderog
-        # Beide können Verkaufsende sein (Kartenzahlung hat take, Bargeld nicht immer)
-        if new_state.startswith("take") or new_state == "enderog":
+        # 🔚 Verkauf abgeschlossen: take unlock
+        if new_state.startswith("take"):
             if sale_in_progress:
                 if time.time() - last_erog_time < 45:
-                    # Preis ermitteln: viewprice (primär) oder Kredit-Differenz
-                    price = sale_price_cent
-                    if not price or price <= 0:
-                        # Fallback: readcredit-Differenz
-                        credit = state.get("credit", {})
-                        sale_credit_after = credit.get("units", 0) or 0
-                        diff = sale_credit_before - sale_credit_after
-                        # Karten-Kredit: 4900/5400/10000 typisch
-                        # Bei Kartenkauf ist der Kredit vorher hoch und geht auf 0
-                        # Differenz ist dann 4900-0=4900 → zu hoch!
-                        # Nur verwenden wenn < 1000 (max 10€) UND vorher < 500 (Bargeld)
-                        if 1 <= diff <= 1000:
-                            price = diff
-                            log(f"   Preis aus Kredit-Differenz: {diff} Cent")
-                        elif sale_credit_before > 1000:
-                            # Kartenzahlung erkannt: Kredit-Vorher war sehr hoch
-                            # Preis = SLOT-PREIS aus state.prices[current_sale_slot]!
-                            slot_idx = str(current_sale_slot) if current_sale_slot else None
-                            prices = state.get("prices", {})
-                            if slot_idx and slot_idx in prices:
-                                p_entry = prices[slot_idx]
-                                if isinstance(p_entry, dict) and "price_cent" in p_entry:
-                                    price = p_entry["price_cent"]
-                                    log(f"   Preis aus Slot-Preis: {price} Cent (Slot {slot_idx})")
-                                elif isinstance(p_entry, (int, float)):
-                                    price = int(p_entry)
-                                    log(f"   Preis aus Slot-Preis: {price} Cent (Slot {slot_idx})")
-                                else:
-                                    log(f"   Kartenzahlung erkannt, diff={diff}, Slot-Preis unerwartet: {p_entry}")
-                            else:
-                                log(f"   Kartenzahlung erkannt, diff={diff}, kein Slot-Preis")
-                            if not price or (isinstance(price, (int, float)) and price <= 0):
-                                price = None
+                    # PREIS ERMITTELN
+                    price = None
+                    
+                    if sale_is_card:
+                        # 💳 KARTE: Preis aus Slot-Tabelle
+                        slot_idx = str(current_sale_slot) if current_sale_slot else None
+                        prices = state.get("prices", {})
+                        if slot_idx and slot_idx in prices:
+                            p_entry = prices[slot_idx]
+                            if isinstance(p_entry, dict) and "price_cent" in p_entry:
+                                price = p_entry["price_cent"]
+                            elif isinstance(p_entry, (int, float)):
+                                price = int(p_entry)
+                        if price:
+                            log(f"   💳 Preis aus Slot-Tabelle: {price} Cent")
+                        else:
+                            log(f"   ⚠️  Karte aber kein Slot-Preis für {slot_idx}")
+                    else:
+                        # 💵 CASH: Preis aus viewprice
+                        price = sale_price_cent if sale_price_cent > 0 else None
+                        
+                        # Fallback: Kredit-Differenz (wenn viewprice mal fehlt)
+                        if not price:
+                            credit = state.get("credit", {})
+                            sale_credit_after = credit.get("units", 0) or 0
+                            diff = sale_credit_before - sale_credit_after
+                            # Bei Cash: z.B. 500 - 250 = 250 (Rückgeld 250, Preis 250)
+                            # oder: 250 - 0 = 250 (exakt bezahlt)
+                            if 1 <= diff <= 10000:
+                                # ABER: bei 5€-Schein + 2.50€ Rückgeld ist diff = 500-250=250
+                                # bei exakter Zahlung: diff = 250-0=250
+                                # Beide Fälle: diff = 250 = korrekt!
+                                # Rückgeld-Fall: credit_after=250, diff=250 (nicht der Preis!)
+                                # Lösung: bei Cash ist der Kredit-Verlauf: 
+                                # vorher 500, nach take 0 oder whatever
+                                # Der PREIS ist: Kredit_davor - Kredit_waehrend_erog
+                                # ODER einfacher: viewprice!
+                                log(f"   ⚠️  Cash-Fallback: Kredit-Diff {diff} (bp={sale_credit_before}→{sale_credit_after})")
+                                price = diff
+                        
+                        if price:
+                            log(f"   💵 Preis: {price} Cent (viewprice={sale_price_cent})")
 
                     if price and price > 0:
                         slot_str = f"Slot {current_sale_slot}" if current_sale_slot else "unbekannt"
@@ -589,11 +602,7 @@ def detect_sale(line, parsed, state):
                         z1 = temps.get("zone1", "?")
                         z2 = temps.get("zone2", "?")
 
-                        # Cash (credit_before < 500) oder Karte (>= 500)
-                        if sale_credit_before > 500:
-                            payment_method = "💳 Karte"
-                        else:
-                            payment_method = "💵 Cash"
+                        payment_method = "💳 Karte" if sale_is_card else "💵 Cash"
 
                         # Produktname aus Katalog (falls vorhanden)
                         product_name = None
@@ -622,8 +631,16 @@ def detect_sale(line, parsed, state):
                         save_event(state, event_type="sale", event_data={
                             "slot": current_sale_slot,
                             "price_cent": price,
-                            "price_eur": amount_eur
+                            "price_eur": amount_eur,
+                            "payment_method": "card" if sale_is_card else "cash",
+                            "credit_before": sale_credit_before
                         })
+                        
+                        # Reset für nächsten Verkauf
+                        sale_in_progress = False
+                        sale_price_cent = 0
+                        sale_is_card = False
+                        current_sale_slot = None
                     else:
                         log(f"⏭  take/enderog ohne Preis - ignoriert")
                 else:
