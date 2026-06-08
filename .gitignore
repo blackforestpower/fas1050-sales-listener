@@ -1,0 +1,16 @@
+# Data (live logging, wird nicht versioniert)
+data/current_state.json
+data/events.jsonl
+data/raw_stream.log
+data/raw_stream.log.*
+
+# Secrets
+.telegram_token
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Backups (automatisch vom Skript erstellt)
+backup_*/

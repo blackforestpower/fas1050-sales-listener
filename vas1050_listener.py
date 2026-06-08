@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════╗
+║             VaS 1050 Vending Machine Listener                ║
+║                                                              ║
+║  LiSPI (listen only, no transmit) — PASSIVER LAUSCHER        ║
+║  Verbindet sich zum VaS 1050 Automaten und zeichnet alle     ║
+║  Daten auf, die der Automat von sich aus sendet.             ║
+║                                                              ║
+║  KEINE Kommandos werden gesendet — nur mithören!             ║
+╚══════════════════════════════════════════════════════════════╝
+
+PROTOKOLL-BESCHREIBUNG:
+========================
+Der VaS 1050 (FAS International) sendet auf TCP-Port 8888
+kontinuierlich Statusdaten im Klartext (ASCII). Die Verbindung
+ist unidirektional — der Automat pusht, der Client lauscht nur.
+
+DATENFORMAT:
+------------
+Jede Zeile hat das Format:
+    <befehl>: ack <wert1> <wert2> ...
+
+Bekannte Befehle:
+─────────────────
+    selstate: ack <zustand>
+        → Verkaufsstatus: "enderog" = bereit, "erog" = Ausgabe läuft
+    
+    readerrors: ack <byte> <code> <count>
+        → Fehlerstatus: Byte, Fehlercode, Anzahl
+    
+    gettemperature: ack <temp1> <temp2>
+        → Kühltemperatur in Zehntelgrad (78 = 7.8°C, -20 = -2.0°C)
+    
+    gettemperaturetwo 1: ack <temp1> <temp2>
+        → Dual-Zonen Temperatur
+    
+    readprice <rack> <slot>: ack <id> <preis_cent> 10 10
+        → Preis eines Slots (preis_cent / 100 = Euro)
+          z.B. "readprice 1 11: ack 101 600 10 10" = Rack1/Slot11 = 6.00€
+    
+    readcredit: ack <einheiten> <anzahl>
+        → Guthaben/Wertmarken (evtl. Verkaufszähler)
+    
+    readclock: ack <tag> <mon> <jahr> <wtag> <std> <min> <sec>
+        → Interne Uhr des Automaten
+
+AUSGABEDATEIEN:
+───────────────
+    current_state.json   → Aktueller Zustand (wird überschrieben)
+    events.jsonl           → Relevante Ereignisse (Verkäufe, Zustandswechsel)
+    raw_stream.log        → Rohdaten (jede Zeile mit Zeitstempel)
+
+INSTALLATION (systemd):
+───────────────────────
+    sudo cp vas1050-listener.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable vas1050-listener.service
+    sudo systemctl start vas1050-listener.service
+"""
+
+import socket
+import json
+import time
+import os
+import sys
+from datetime import datetime
+from urllib.request import Request, urlopen
+from urllib.error import URLError
+
+# ─── KONFIGURATION ────────────────────────────────────────────
+HOST = "192.168.200.146"         # IP des VaS 1050 Automaten
+PORT = 8888                       # TCP-Port (Management-Interface)
+RECONNECT_DELAY = 5               # Sekunden bis zum Wiederverbinden
+
+# ─── TELEGRAM ────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_TRADING_GROUP = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "-5134447945")
+TELEGRAM_ENABLED = True
+
+# Fallback: Falls Environment-Variablen nicht gesetzt,
+# Token aus externer Datei laden (damit nicht im Code sichtbar)
+if not TELEGRAM_BOT_TOKEN:
+    token_file = os.path.join(os.path.dirname(__file__), ".telegram_token")
+    try:
+        with open(token_file) as f:
+            TELEGRAM_BOT_TOKEN = f.read().strip()
+    except FileNotFoundError:
+        log("⚠️  Kein Telegram-Token gefunden (weder ENV noch Datei)")
+# ──────────────────────────────────────────────────────────────
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+STATE_FILE = os.path.join(DATA_DIR, "current_state.json")
+EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
+RAW_FILE = os.path.join(DATA_DIR, "raw_stream.log")
+CATALOG_FILE = os.path.join(DATA_DIR, "product_catalog.json")
+# ──────────────────────────────────────────────────────────────
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def rotate_log_if_needed():
+    """raw_stream.log rotieren wenn >24h alt oder >5MB"""
+    try:
+        size = os.path.getsize(RAW_FILE)
+        age = time.time() - os.path.getmtime(RAW_FILE)
+        MAX_SIZE = 5 * 1024 * 1024  # 5 MB
+        MAX_AGE = 24 * 3600  # 24h
+        if size > MAX_SIZE or age > MAX_AGE:
+            ts_rot = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rotated = f"{RAW_FILE}.{ts_rot}"
+            os.rename(RAW_FILE, rotated)
+            log(f"🔄 Log rotiert → {os.path.basename(rotated)} ({size//1024}KB, {age//3600:.0f}h alt)")
+            # Alte Rotationen (>7 Tage) löschen
+            from pathlib import Path
+            for f in Path(DATA_DIR).glob("raw_stream.log.*"):
+                if time.time() - f.stat().st_mtime > 7 * 86400:
+                    f.unlink()
+                    log(f"🧹 Altes Log gelöscht: {f.name}")
+    except FileNotFoundError:
+        pass  # Neu, kein rotate nötig
+
+
+def load_prices_from_log():
+    """Beim Start: Preise aus raw_stream.log laden (letzten kompletten readprice-Burst)"""
+    prices = {}
+    try:
+        with open(RAW_FILE) as f:
+            for line in f:
+                if "readprice" not in line or ": ack" not in line:
+                    continue
+                # "readprice 0 11: ack 1 500 210 210"
+                idx = line.index("readprice")
+                line = line[idx:]
+                idx2 = line.index(": ack")
+                cmd_part = line[:idx2]
+                rest = line[idx2 + 5:].strip()
+                parts = cmd_part.split()
+                if len(parts) >= 3:
+                    try:
+                        rack = int(parts[1])
+                        slot = int(parts[2])
+                    except ValueError:
+                        continue
+                val_parts = rest.split()
+                if len(val_parts) >= 2:
+                    try:
+                        slot_id = int(val_parts[0])
+                        price_cent = int(val_parts[1])
+                    except ValueError:
+                        continue
+                    slot_num = str(rack * 100 + slot)
+                    prices[slot_num] = {
+                        "slot_id": slot_id,
+                        "price_cent": price_cent,
+                        "price_eur": price_cent / 100.0
+                    }
+    except FileNotFoundError:
+        pass
+    log(f"🏷  Geladene Preise aus Log: {len(prices)} Slots")
+    return prices
+
+
+# ═══════════════════════════════════════════════════════════════
+#  HELFER
+# ═══════════════════════════════════════════════════════════════
+
+def ts():
+    """Aktueller Zeitstempel als lesbarer String"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg):
+    """Loggt eine Zeile mit Zeitstempel auf stdout (geht in systemd journal)"""
+    print(f"[{ts()}] {msg}", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PARSER
+# ═══════════════════════════════════════════════════════════════
+
+def parse_line(line):
+    """
+    Parst eine einzelne Zeile vom Automaten.
+    
+    Erkennbare Formate:
+    - "Hello :-) ..." → Begrüßung
+    - "<cmd>: ack <val1> <val2> ..." → Datum
+    
+    Returns: dict mit type, command, values und spezifischen Feldern
+    """
+    # Begrüßung (kommt einmalig bei Verbindungsaufbau)
+    if "ack " not in line and "Hello" in line:
+        return {"type": "greeting", "raw": line}
+
+    # Normale Datenzeile
+    if ": ack" in line:
+        idx = line.index(": ack")
+        cmd = line[:idx].strip()
+        rest = line[idx + 5:].strip()
+        values = rest.strip().split()
+        result = {"type": "data", "command": cmd, "values": values, "raw": line}
+
+        # ── Temperatur ──────────────────────────────────────
+        # gettemperature: ack <t1> <t2>   → Zone 1 = t1/10 °C
+        # gettemperaturetwo 1: ack <t1> <t2> → Zone 2 = t1/10 °C
+        # Nur der ERSTE Wert ist die Temperatur, der zweite ist Dummy/Wert
+        if "temperaturetwo" in cmd and len(values) >= 1:
+            result["temp_c"] = int(values[0]) / 10.0  # Zehntelgrad → Grad
+            result["zone"] = "Zone 2"
+        elif "temperature" in cmd and len(values) >= 1:
+            result["temp_c"] = int(values[0]) / 10.0
+            result["zone"] = "Zone 1"
+
+        # ── Preis pro Slot ──────────────────────────────────
+        elif "readprice" in cmd:
+            # Befehl: "readprice 1 11" → Rack 1, Slot 11
+            parts = cmd.split()
+            if len(parts) >= 3:
+                result["rack"] = int(parts[1])
+                result["slot"] = int(parts[2])
+            # Werte: "ack 101 600 10 10" → SlotID=101, Preis=600¢ = 6,00€
+            if len(values) >= 2:
+                result["slot_id"] = int(values[0])
+                result["price_cent"] = int(values[1])
+                result["price_eur"] = int(values[1]) / 100.0
+
+        # ── Fehler ──────────────────────────────────────────
+        elif "readerrors" in cmd and len(values) >= 3:
+            result["error_byte"] = int(values[0])
+            result["error_code"] = int(values[1])
+            result["error_count"] = int(values[2])
+
+        # ── Verkaufsstatus ─────────────────────────────────
+        elif "selstate" in cmd:
+            result["state"] = values[0] if values else "unknown"
+
+        # ── Guthaben / Verkaufszähler ──────────────────────
+        elif "readcredit" in cmd and len(values) >= 2:
+            result["credit_units"] = int(values[0])
+            result["credit_count"] = int(values[1])
+
+        # ── Automaten-Uhr ──────────────────────────────────
+        elif "readclock" in cmd and len(values) >= 7:
+            result["datetime"] = {
+                "day": int(values[0]),
+                "month": int(values[1]),
+                "year": int(values[2]),
+                "weekday": int(values[3]),
+                "hour": int(values[4]),
+                "minute": int(values[5]),
+                "second": int(values[6]),
+            }
+
+        return result
+
+    # Unbekanntes Format
+    return {"type": "unknown", "raw": line}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ZUSTANDSMANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+def process_line(line, state, last_state):
+    """
+    Verarbeitet eine eingehende Zeile:
+    1. Loggt sie ins raw_stream.log
+    2. Parst sie
+    3. Aktualisiert den Zustand bei Änderung
+    4. Speichert State + Event bei Änderung
+    """
+    # Rohdaten-Log (jede Zeile)
+    with open(RAW_FILE, "a") as f:
+        f.write(f"[{ts()}] {line}\n")
+
+    # Parsen
+    parsed = parse_line(line)
+    if parsed["type"] == "greeting":
+        state["greeting"] = line
+        log(f"👋 {line}")
+        return
+
+    if parsed["type"] != "data":
+        return
+
+    cmd = parsed.get("command", "")
+
+    # Prüfen ob sich was geändert hat
+    changed = False
+
+    # ── Preise ──────────────────────────────────────────────
+    if "readprice" in cmd:
+        slot_num = str(parsed['rack'] * 100 + parsed['slot'])
+        val = {
+            "slot_id": parsed["slot_id"],
+            "price_cent": parsed["price_cent"],
+            "price_eur": parsed["price_eur"]
+        }
+        old_prices = state.get("prices", {})
+        if old_prices.get(slot_num) != val:
+            old_prices[slot_num] = val
+            state["prices"] = old_prices
+            changed = True
+            log(f"🏷  Slot {slot_num}: {val['price_eur']:.2f}€")
+
+    # ── Temperaturen ───────────────────────────────────────
+    # gettemperature: Zone 1 (Spirale), gettemperaturetwo: Zone 2 (Türen/Getränke)
+    # Nur erster Wert = Temperatur, zweiter = Dummy
+    elif "temperaturetwo" in cmd or "temperature" in cmd:
+        zone = "zone2" if "two" in cmd else "zone1"
+        temp_c = parsed.get("temp_c")
+        old_temps = state.get("temperatures", {})
+        if old_temps.get(zone) != temp_c:
+            old_temps[zone] = temp_c
+            state["temperatures"] = old_temps
+            changed = True
+            zone_label = "Zone 2" if zone == "zone2" else "Zone 1"
+            log(f"🌡  {zone_label}: {temp_c}°C")
+
+    # ── Fehler ──────────────────────────────────────────────
+    elif "readerrors" in cmd:
+        err = {
+            "byte": parsed["error_byte"],
+            "code": parsed["error_code"],
+            "count": parsed["error_count"]
+        }
+        if state.get("errors") != err:
+            state["errors"] = err
+            changed = True
+            log(f"⚠️  Fehler: Byte={err['byte']} Code={err['code']} "
+                f"Count={err['count']}")
+            # Fehler-Events in events.jsonl (nur wenn Count > 0)
+            if err["count"] > 0:
+                save_event(state, event_type="error", event_data=err)
+
+    # ── Verkaufsstatus ─────────────────────────────────────
+    elif "selstate" in cmd:
+        val = parsed["state"]
+        if state.get("selstate") != val:
+            old_val = state.get("selstate", "???")
+            state["selstate"] = val
+            changed = True
+            log(f"📋  Status: {old_val} → {val}")
+
+    # ── Guthaben / Verkaufszähler ──────────────────────────
+    elif "readcredit" in cmd:
+        val = {"units": parsed["credit_units"], "count": parsed["credit_count"]}
+        if state.get("credit") != val:
+            old = state.get("credit", {})
+            state["credit"] = val
+            changed = True
+            diff = (val.get("count", 0) or 0) - (old.get("count", 0) or 0)
+            if diff > 0 and val.get("units", 0) or 0 > 0:
+                log(f"💰  Kredit geladen: +{val['units']} Cent")
+            elif val.get("count") is not None:
+                log(f"   (Count init: {val['count']})")
+
+    # ── Uhrzeit ────────────────────────────────────────────
+    elif "readclock" in cmd:
+        c = parsed["datetime"]
+        state["clock"] = c
+        changed = True
+        log(f"🕒  Automaten-Zeit: {c['day']:02d}.{c['month']:02d}."
+            f"{c['year']} {c['hour']:02d}:{c['minute']:02d}:"
+            f"{c['second']:02d}")
+
+    # Bei Änderung speichern
+    if changed:
+        state["last_seen"] = datetime.now().isoformat()
+        save_state(state)
+        save_event(state)
+
+    # Verkaufserkennung + Telegram (bei jeder readcredit-Zeile)
+    detect_sale(line, parsed, state)
+
+
+def save_state(state):
+    """Aktuellen Zustand als JSON speichern (immer überschreiben)"""
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def save_event(state, event_type="state_change", event_data=None):
+    """
+    Schreibt relevante Ereignisse in events.jsonl.
+    
+    event_type: "state_change" (Standard), "sale", "credit", "error"
+    event_data: Zusätzliche Infos (z.B. Verkaufsdaten)
+    """
+    entry = {
+        "timestamp": state["last_seen"],
+        "temperatures": state.get("temperatures"),
+        "errors": state.get("errors"),
+        "selstate": state.get("selstate"),
+        "credit": state.get("credit"),
+        "clock": state.get("clock"),
+        "slot_count": len(state.get("prices", {})),
+    }
+    
+    # events.jsonl: NUR relevante Ereignisse
+    # - sale/error: immer
+    # - state_change: nur wenn nicht in enderog-Idle (Verkaufsphase)
+    keep = False
+    if event_type != "state_change":
+        keep = True  # sale, error
+    else:
+        sel = entry.get("selstate", "")
+        if sel not in ("enderog", "viewprice", None, ""):
+            keep = True
+
+    if keep:
+        event_entry = {
+            "time": state["last_seen"],
+            "type": event_type,
+            "state": entry
+        }
+        if event_data:
+            event_entry["data"] = event_data
+        with open(EVENTS_FILE, "a") as f:
+            f.write(json.dumps(event_entry, ensure_ascii=False) + "\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SALES DETECTION + TELEGRAM
+# ═══════════════════════════════════════════════════════════════
+#
+# LOGIK (v3 - 07.06.2026):
+# ─────────────────────────
+# Ein VERKAUF wird nur erkannt wenn:
+#   (A) select → viewprice → busy → erog lock → entnahme → enderog
+#   (B) Der PREIS kommt aus viewprice, NICHT aus Kredit-Differenz!
+#
+# Kredit-Verhalten:
+#   - Bargeld: Kredit steigt beim Einwerfen, sinkt beim Verkauf
+#   - Karte: Kredit wird auf XX.00€ gesetzt, bleibt, wird auf 0 gesetzt
+#   → Kredit-Differenz ist unzuverlässig. viewprice ist die Quelle!
+#
+# Slot aus select <rack> <slot>  →  Anzeige: <rack><slot> (Bsp: 0:35 = 035 = 35)
+# ═══════════════════════════════════════════════════════════════
+
+last_credit_count = 0
+sale_in_progress = False
+sale_price_cent = 0       # Preis aus viewprice
+current_sale_slot = None
+last_erog_time = 0        # epoch seconds
+
+# Kredit-Vergleich für readcredit-Fallback
+sale_credit_before = 0    # Kredit-Wert bei erog
+sale_credit_after = 0     # Kredit-Wert bei take/enderog
+sale_viewprice_confirmed = False  # Wurde viewprice in diesem Verkauf gesehen?
+
+
+def telegram_send(text):
+    """Sendet eine Nachricht an die Trading-Gruppe via Bot-API"""
+    if not TELEGRAM_ENABLED:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({
+            "chat_id": TELEGRAM_TRADING_GROUP,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_notification": False
+        }).encode()
+        req = Request(url, data=payload, headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=10)
+    except Exception as e:
+        log(f"⚠️  Telegram-Fehler: {e}")
+
+
+def detect_sale(line, parsed, state):
+    """
+    Erkennt VERKÄUFE anhand der Protokoll-Sequenz.
+    Preis aus viewprice, Slot aus select, Auslöser = erog+
+    """
+    global last_credit_count, sale_in_progress, sale_price_cent
+    global current_sale_slot, last_erog_time
+    global sale_credit_before, sale_credit_after, sale_viewprice_confirmed
+
+    now = datetime.now()
+
+    cmd = parsed.get("command", "")
+
+    # ── Slot-Erkennung: select <rack> <slot> ... ────────
+    if cmd.startswith("select "):
+        parts = cmd.split()
+        if len(parts) >= 3:
+            rack = int(parts[1])
+            slot_num = int(parts[2])
+            current_sale_slot = str(rack * 100 + slot_num)
+            # NICHT loggen bei jedem select (kann mehrfach kommen)
+
+    # ── viewprice: Preis merken ───────────────────────────
+    if cmd == "selstate":
+        new_state = parsed.get("state", "")
+
+        if new_state.startswith("viewprice"):
+            vals = parsed.get("values", [])
+            if vals:
+                try:
+                    price_in_view = int(vals[0])
+                    if 1 <= price_in_view <= 1000:
+                        sale_price_cent = price_in_view
+                        # Wenn wir in einem Verkauf sind, Preis bestätigen
+                        if sale_in_progress:
+                            sale_viewprice_confirmed = True
+                except (ValueError, IndexError):
+                    pass
+
+        # 🔥 Echter Verkauf: erog = Ausgabe läuft!
+        if new_state.startswith("erog"):
+            if time.time() - last_erog_time > 3:
+                last_erog_time = time.time()
+                if not sale_in_progress:
+                    sale_in_progress = True
+                    sale_viewprice_confirmed = False
+                    
+                    # Preis aus viewprice-Event (beim line-Parsing) oder state
+                    if not sale_price_cent or sale_price_cent <= 0:
+                        st_str = state.get("selstate", "")
+                        # state: "viewprice" oder "busy" o.ä.
+                        # In manchen Fällen steht der viewprice im state
+                        if "viewprice" in st_str:
+                            parts = st_str.split()
+                            for p in parts:
+                                try:
+                                    pv = int(p)
+                                    if 1 <= pv <= 1000:
+                                        sale_price_cent = pv
+                                        break
+                                except ValueError:
+                                    pass
+                    
+                    # Kredit-Vorher: LIVE aus AUSGANGS-Kredit des Automaten
+                    # Bei Kartenzahlung: Kredit 4900 → 0 (das ist Reserve, nicht Preis!)
+                    # Bei Bargeld: Kredit 100 → 0 oder so
+                    credit = state.get("credit", {})
+                    sale_credit_before = credit.get("units", 0) or 0
+                    
+                    log(f"🛒  VERKAUF ({current_sale_slot or '?'}) | "
+                        f"viewprice={sale_price_cent or '?'} Cent | "
+                        f"credit_before={sale_credit_before}")
+
+        # 🔚 Verkauf abgeschlossen: take unlock ODER enderog
+        # Beide können Verkaufsende sein (Kartenzahlung hat take, Bargeld nicht immer)
+        if new_state.startswith("take") or new_state == "enderog":
+            if sale_in_progress:
+                if time.time() - last_erog_time < 45:
+                    # Preis ermitteln: viewprice (primär) oder Kredit-Differenz
+                    price = sale_price_cent
+                    if not price or price <= 0:
+                        # Fallback: readcredit-Differenz
+                        credit = state.get("credit", {})
+                        sale_credit_after = credit.get("units", 0) or 0
+                        diff = sale_credit_before - sale_credit_after
+                        # Karten-Kredit: 4900/5400/10000 typisch
+                        # Bei Kartenkauf ist der Kredit vorher hoch und geht auf 0
+                        # Differenz ist dann 4900-0=4900 → zu hoch!
+                        # Nur verwenden wenn < 1000 (max 10€) UND vorher < 500 (Bargeld)
+                        if 1 <= diff <= 1000:
+                            price = diff
+                            log(f"   Preis aus Kredit-Differenz: {diff} Cent")
+                        elif sale_credit_before > 1000:
+                            # Kartenzahlung erkannt: Kredit-Vorher war sehr hoch
+                            # Preis = SLOT-PREIS aus state.prices[current_sale_slot]!
+                            slot_idx = str(current_sale_slot) if current_sale_slot else None
+                            prices = state.get("prices", {})
+                            if slot_idx and slot_idx in prices:
+                                p_entry = prices[slot_idx]
+                                if isinstance(p_entry, dict) and "price_cent" in p_entry:
+                                    price = p_entry["price_cent"]
+                                    log(f"   Preis aus Slot-Preis: {price} Cent (Slot {slot_idx})")
+                                elif isinstance(p_entry, (int, float)):
+                                    price = int(p_entry)
+                                    log(f"   Preis aus Slot-Preis: {price} Cent (Slot {slot_idx})")
+                                else:
+                                    log(f"   Kartenzahlung erkannt, diff={diff}, Slot-Preis unerwartet: {p_entry}")
+                            else:
+                                log(f"   Kartenzahlung erkannt, diff={diff}, kein Slot-Preis")
+                            if not price or (isinstance(price, (int, float)) and price <= 0):
+                                price = None
+
+                    if price and price > 0:
+                        slot_str = f"Slot {current_sale_slot}" if current_sale_slot else "unbekannt"
+                        amount_eur = price / 100.0
+
+                        temps = state.get("temperatures", {})
+                        z1 = temps.get("zone1", "?")
+                        z2 = temps.get("zone2", "?")
+
+                        # Cash (credit_before < 500) oder Karte (>= 500)
+                        if sale_credit_before > 500:
+                            payment_method = "💳 Karte"
+                        else:
+                            payment_method = "💵 Cash"
+
+                        # Produktname aus Katalog (falls vorhanden)
+                        product_name = None
+                        if current_sale_slot:
+                            cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
+                            if cat_entry:
+                                product_name = cat_entry.get("name")
+
+                        msg = (
+                            f"🛒 <b>Verkauf am Automaten! ({now.strftime('%H:%M')} Uhr)</b>\n"
+                            f"💰 {amount_eur:.2f}€ {payment_method}\n"
+                            f"📍 {slot_str}"
+                        )
+                        if product_name:
+                            msg += f" — {product_name}\n"
+                        else:
+                            msg += "\n"
+                        msg += (
+                            f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
+                        )
+                        telegram_send(msg)
+                        log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str}")
+                        
+                        # Event-Log für events.jsonl
+                        state["last_seen"] = now.isoformat()
+                        save_event(state, event_type="sale", event_data={
+                            "slot": current_sale_slot,
+                            "price_cent": price,
+                            "price_eur": amount_eur
+                        })
+                    else:
+                        log(f"⏭  take/enderog ohne Preis - ignoriert")
+                else:
+                    log(f"⏭  take/enderog ohne erog in 45s - ignoriert")
+
+                # Aufräumen
+                sale_in_progress = False
+                sale_price_cent = 0
+                sale_credit_before = 0
+                sale_credit_after = 0
+
+    # ── Kredit nur fürs Log und Fallback-Preis ──────────
+    if cmd == "readcredit":
+        new_count = parsed.get("credit_count", 0) or 0
+        if new_count != last_credit_count and new_count > 0:
+            last_credit_count = new_count
+            log(f"💰  Kredit geladen: {parsed.get('credit_units', 0)} Cent (Verkäufe: {last_credit_count})")
+
+    # Temperatur-Logging alle 11 Sekunden unterdrücken wir
+    # indem wir nur relevante States loggen
+    # -> erledigt im process_line
+
+
+# ═══════════════════════════════════════════════════════════════
+#  HAUPTLOOP
+# ═══════════════════════════════════════════════════════════════
+
+def listen_forever():
+    """
+    Endlose Hauptschleife (v2 - non-blocking loop).
+    - Verbindet zu HOST:PORT
+    - Liest alle eingehenden Daten (non-blocking mit Polling)
+    - Verarbeitet sie (parser + state)
+    - Bei Verbindungsabbruch: warten und neu verbinden
+    """
+    state = {}  # Aktueller Zustand (wächst mit jedem neuen Datentyp)
+    # Log-Rotation: raw_stream.log alle 24h oder >5MB rotieren
+    rotate_log_if_needed()
+    # Preise aus raw_stream.log laden (für Slot-Preis-Fallback bei Kartenzahlung)
+    # Wichtig: NACH rotate, damit wir die Preise aus dem aktuellen Log laden
+    state["prices"] = load_prices_from_log()
+    
+    # Produkt-Katalog laden
+    state["catalog"] = {}
+    try:
+        with open(CATALOG_FILE) as f:
+            state["catalog"] = json.load(f)
+        log(f"📦 Produkt-Katalog geladen: {len(state['catalog'])} Einträge")
+    except (FileNotFoundError, json.JSONDecodeError):
+        log("⚠️  Kein Produkt-Katalog (product_catalog.json) – Verkäufe ohne Produktnamen")
+
+    while True:
+        # ── Verbinden ───────────────────────────────────────
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)   # 1s recv-Timeout für regelmäßige Polls
+            s.connect((HOST, PORT))
+            log(f"✅ Verbunden mit {HOST}:{PORT}")
+        except Exception as e:
+            log(f"❌ Verbindung fehlgeschlagen: {e}")
+            time.sleep(RECONNECT_DELAY)
+            continue
+
+        # ── Initialen Daten-Burst empfangen ────────────────
+        # Mehrere recv-Aufrufe, bis 3s Pause oder Ende
+        initial_data = b""
+        s.settimeout(1.0)
+        for _ in range(6):  # max 6 x 1s = 6s warten
+            try:
+                chunk = s.recv(8192)
+                if not chunk:
+                    break
+                initial_data += chunk
+            except socket.timeout:
+                break
+        if initial_data:
+            text = initial_data.decode("latin1", errors="replace")
+            for line in text.split("\r\n"):
+                line = line.strip()
+                if line:
+                    process_line(line, state, None)
+            log(f"📦 Initial-Burst: {len(initial_data)} Bytes, "
+                f"{len(state.get('prices', {}))} Preise geladen")
+
+        # ── Polling-Loop mit 1s recv-Timeout ─────────────
+        s.settimeout(1.0)
+        buffer = b""
+        idle_cycles = 0
+        while True:
+            try:
+                chunk = s.recv(8192)
+                if not chunk:
+                    log("⚠️ Verbindung vom Automaten geschlossen")
+                    break
+
+                idle_cycles = 0  # Daten empfangen
+
+                # Pufferverwaltung für fragmentierte TCP-Pakete
+                buffer += chunk
+                text = buffer.decode("latin1", errors="replace")
+
+                # Nach Zeilenumbrüchen splitten
+                while "\r\n" in text:
+                    line, text = text.split("\r\n", 1)
+                    line = line.strip()
+                    if line:
+                        process_line(line, state, None)
+
+                buffer = text.encode("latin1", errors="replace")
+
+            except socket.timeout:
+                # Normal: kein Data in diesem 1s-Fenster
+                idle_cycles += 1
+                # Alle 60 Zyklen (~60s) einen Heartbeat-Log
+                # (damit wir sehen dass die Verbindung noch lebt)
+                if idle_cycles % 60 == 0:
+                    log(f"💓 Heartbeat (verbunden seit id={idle_cycles//60} min)")
+                continue
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                log(f"⚠️ Verbindungsfehler: {e}")
+                break
+            except Exception as e:
+                log(f"❌ Unerwarteter Fehler: {e}")
+                break
+
+        s.close()
+        log(f"🔌 Neustart in {RECONNECT_DELAY}s...")
+        time.sleep(RECONNECT_DELAY)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EINSTIEGSPUNKT
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    log("🚀 VaS 1050 Live-Listener gestartet")
+    log(f"📁 Automat: {HOST}:{PORT}")
+    log(f"📁 State:   {STATE_FILE}")
+    log(f"📝 Raw:     {RAW_FILE}")
+    log(f"📊 Events:  {EVENTS_FILE}")
+    log("=" * 50)
+    log("📡 Warte auf Daten vom Automaten...")
+    listen_forever()
