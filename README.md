@@ -123,7 +123,7 @@ Alle Einstellungen erfolgen via **`.env` Datei** (siehe `.env.example` für alle
 ```bash
 cp .env.example .env
 # Dann .env editieren und echte Werte eintragen:
-#   VAS1050_HOST=192.168.x.x
+#   VAS1050_HOST=x.x.x.x
 #   VAS1050_TELEGRAM_BOT_TOKEN=dein_bot_token
 #   VAS1050_TELEGRAM_CHAT_ID=deine_chat_id
 ```
