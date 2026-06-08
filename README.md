@@ -122,7 +122,7 @@ Umgebungsvariablen (oder Datei `.telegram_token` im Projektordner):
 
 ```
 VAS1050_TELEGRAM_BOT_TOKEN=dein_bot_token
-VAS1050_TELEGRAM_CHAT_ID=-5134447945
+VAS1050_TELEGRAM_CHAT_ID=deine_gruppen_chat_id
 ```
 
 ## Manueller Test
