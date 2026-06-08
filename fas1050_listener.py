@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║             VaS 1050 Vending Machine Listener                ║
+║             FAS 1050 PRO Vending Machine Listener            ║
 ║                                                              ║
 ║  LiSPI (listen only, no transmit) — PASSIVER LAUSCHER        ║
-║  Verbindet sich zum VaS 1050 Automaten und zeichnet alle     ║
+║  Verbindet sich zum FAS 1050 PRO Automaten und zeichnet alle ║
 ║  Daten auf, die der Automat von sich aus sendet.             ║
 ║                                                              ║
 ║  KEINE Kommandos werden gesendet — nur mithören!             ║
@@ -12,7 +12,7 @@
 
 PROTOKOLL-BESCHREIBUNG:
 ========================
-Der VaS 1050 (FAS International) sendet auf TCP-Port 8888
+Der FAS 1050 PRO (FAS International) sendet auf TCP-Port 8888
 kontinuierlich Statusdaten im Klartext (ASCII). Die Verbindung
 ist unidirektional — der Automat pusht, der Client lauscht nur.
 
@@ -53,10 +53,10 @@ AUSGABEDATEIEN:
 
 INSTALLATION (systemd):
 ───────────────────────
-    sudo cp vas1050-listener.service /etc/systemd/system/
+    sudo cp fas1050-listener.service /etc/systemd/system/
     sudo systemctl daemon-reload
-    sudo systemctl enable vas1050-listener.service
-    sudo systemctl start vas1050-listener.service
+    sudo systemctl enable fas1050-listener.service
+    sudo systemctl start fas1050-listener.service
 """
 
 import socket
@@ -68,25 +68,30 @@ from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+# ─── .env LADEN ──────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 # ─── KONFIGURATION ────────────────────────────────────────────
-HOST = "X.X.X.X"                  # IP des FAS 1050 Automaten (lokal anpassen!)
-PORT = 8888                       # TCP-Port (Management-Interface)
-RECONNECT_DELAY = 5               # Sekunden bis zum Wiederverbinden
+# Alle Konfiguration via .env Datei (siehe .env.example)
+HOST = os.environ.get("VAS1050_HOST", "X.X.X.X")
+PORT = int(os.environ.get("VAS1050_PORT", "8888"))
+RECONNECT_DELAY = int(os.environ.get("VAS1050_RECONNECT_DELAY", "5"))
 
 # ─── TELEGRAM ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_TRADING_GROUP = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = True
 
-# Fallback: Falls Environment-Variablen nicht gesetzt,
-# Token aus externer Datei laden (damit nicht im Code sichtbar)
+# Fallback: Falls keine .env oder Env-Variablen vorhanden,
+# Token aus Datei .telegram_token laden
 if not TELEGRAM_BOT_TOKEN:
     token_file = os.path.join(os.path.dirname(__file__), ".telegram_token")
     try:
         with open(token_file) as f:
             TELEGRAM_BOT_TOKEN = f.read().strip()
     except FileNotFoundError:
-        log("⚠️  Kein Telegram-Token gefunden (weder ENV noch Datei)")
+        log("⚠️  Kein Telegram-Token gefunden (weder ENV, .env noch Datei)")
 # ──────────────────────────────────────────────────────────────
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -568,11 +573,11 @@ def detect_sale(line, parsed, state):
                         f"credit_before={sale_credit_before} | "
                         f"{'💳 Karte' if sale_is_card else '💵 Cash'}")
 
-        # 🔚 Verkauf abgeschlossen: take unlock
-        if new_state.startswith("take"):
+        # 🔚 Verkauf abgeschlossen: take unlock oder enderog (wenn kein take)
+        if new_state.startswith("take") or new_state.startswith("enderog"):
             if sale_in_progress:
                 if time.time() - last_erog_time < 45:
-                    # PREIS ERMITTELN
+                    # PREIS ERMITTELN (gleiche Logik für take und enderog)
                     price = None
                     
                     if sale_is_card:
@@ -595,15 +600,9 @@ def detect_sale(line, parsed, state):
                         
                         # Fallback: Kredit-Differenz (wenn viewprice mal fehlt)
                         if not price:
-                            # Fall 1: Rückgeld (z.B. 500€ → 250€ Rest → 0€):
-                            #   credit_during_erog = 250, diff = 500-250 = 250 ✅
                             diff = sale_credit_before - sale_credit_during_erog
-
-                            # Fall 2: Exakte Zahlung (z.B. 250 → 250 → 0):
-                            #   credit_during_erog = 250 (gleich wie before) = der Preis!
                             if diff == 0 and sale_credit_during_erog > 0:
                                 diff = sale_credit_during_erog
-
                             if 1 <= diff <= 1000:
                                 log(f"   Cash-Fallback: {sale_credit_before} - {sale_credit_during_erog} = {diff} Cent")
                                 price = diff
@@ -621,7 +620,6 @@ def detect_sale(line, parsed, state):
 
                         payment_method = "💳 Karte" if sale_is_card else "💵 Cash"
 
-                        # Produktname aus Katalog (falls vorhanden)
                         product_name = None
                         if current_sale_slot:
                             cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
@@ -637,13 +635,10 @@ def detect_sale(line, parsed, state):
                             msg += f" — {product_name}\n"
                         else:
                             msg += "\n"
-                        msg += (
-                            f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
-                        )
+                        msg += f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
                         telegram_send(msg)
                         log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str}")
                         
-                        # Event-Log für events.jsonl
                         state["last_seen"] = now.isoformat()
                         save_event(state, event_type="sale", event_data={
                             "slot": current_sale_slot,
@@ -659,16 +654,11 @@ def detect_sale(line, parsed, state):
                         sale_is_card = False
                         sale_credit_during_erog = 0
                         current_sale_slot = None
+                        sale_credit_before = 0
                     else:
-                        log(f"⏭  take/enderog ohne Preis - ignoriert")
+                        log(f"⏭  {new_state} ohne Preis - ignoriert")
                 else:
-                    log(f"⏭  take/enderog ohne erog in 45s - ignoriert")
-
-                # Aufräumen
-                sale_in_progress = False
-                sale_price_cent = 0
-                sale_credit_before = 0
-                sale_credit_after = 0
+                    log(f"⏭  {new_state} ohne erog in 45s - ignoriert")
 
     # ── Kredit nur fürs Log und Fallback-Preis ──────────
     if cmd == "readcredit":
@@ -794,7 +784,7 @@ def listen_forever():
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    log("🚀 VaS 1050 Live-Listener gestartet")
+    log("🚀 FAS 1050 PRO Live-Listener gestartet")
     log(f"📁 Automat: {HOST}:{PORT}")
     log(f"📁 State:   {STATE_FILE}")
     log(f"📝 Raw:     {RAW_FILE}")

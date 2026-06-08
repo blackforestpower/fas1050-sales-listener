@@ -114,15 +114,18 @@ sudo systemctl status fas1050-listener.service
 sudo journalctl -u fas1050-listener.service -f
 ```
 
-## Telegram-Konfiguration
+## Konfiguration
 
-Optional: Telegram-Benachrichtigungen bei Verkäufen.
+Alle Einstellungen erfolgen via **`.env` Datei** (siehe `.env.example` für alle verfügbaren Optionen).
 
-Umgebungsvariablen (oder Datei `.telegram_token` im Projektordner):
+➡️ `.env` liegt im Projektordner, ist in `.gitignore` und wird **nicht versioniert**. Das Skript lädt sie automatisch via `python-dotenv`.
 
-```
-VAS1050_TELEGRAM_BOT_TOKEN=dein_bot_token
-VAS1050_TELEGRAM_CHAT_ID=deine_gruppen_chat_id
+```bash
+cp .env.example .env
+# Dann .env editieren und echte Werte eintragen:
+#   VAS1050_HOST=192.168.x.x
+#   VAS1050_TELEGRAM_BOT_TOKEN=dein_bot_token
+#   VAS1050_TELEGRAM_CHAT_ID=deine_chat_id
 ```
 
 ## Manueller Test
@@ -131,8 +134,6 @@ VAS1050_TELEGRAM_CHAT_ID=deine_gruppen_chat_id
 python3 fas1050_listener.py
 # Oder: Rohdaten live verfolgen
 tail -f data/raw_stream.log
-# Oder via Daemon-Wrapper:
-./fas1050_daemon.sh
 ```
 
 ## Technische Daten
@@ -146,7 +147,7 @@ tail -f data/raw_stream.log
 | Authentifizierung | Keine |
 | Protokoll | Reines ASCII, zeilenbasiert |
 
-> ⚠️ **Hinweis zur Erreichbarkeit:** Der Automat ist **nur im lokalen Netzwerk (LAN/WLAN)** erreichbar. Die IP muss in deiner eigenen Netzwerkkonfiguration ermittelt und in `fas1050_listener.py` als Konstante `AUTOMAT_HOST` eingetragen werden.
+> ⚠️ **Hinweis zur Erreichbarkeit:** Der Automat ist **nur im lokalen Netzwerk (LAN/WLAN)** erreichbar. Die IP wird in der `.env` Datei als `VAS1050_HOST` konfiguriert.
 
 ## Lizenz
 
