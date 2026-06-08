@@ -74,16 +74,18 @@ VAS1050_TELEGRAM_CHAT_ID=-1234567890
 ## Manueller Test
 
 ```bash
-python3 vas1050_listener.py
+python3 fas1050_listener.py
 # Oder: Rohdaten live verfolgen
 tail -f data/raw_stream.log
+# Oder via Daemon-Wrapper:
+./fas1050_daemon.sh
 ```
 
 ## Technische Daten
 
 | Eigenschaft | Wert |
 |-------------|------|
-| Automat | VaS 1050 PRO (FAS International) |
+| Automat | FAS 1050 PRO |
 | IP | 192.168.200.146 |
 | Port | TCP 8888 (Management-Interface) |
 | Port 8889 | Seriennummer (202425042) |

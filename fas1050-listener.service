@@ -1,12 +1,13 @@
 [Unit]
-Description=VaS 1050 Vending Machine Listener
+[Unit]
+Description=FAS 1050 PRO Vending Machine Listener
 Documentation=https://github.com/openclaw/openclaw (Projekt camiro-automat-vas1050)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/root/.openclaw/workspace/camiro-automat-vas1050/vas1050_listener.py
+ExecStart=/root/.openclaw/workspace/camiro-automat-vas1050/fas1050_listener.py
 Restart=always
 RestartSec=10
 User=root
