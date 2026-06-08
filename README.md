@@ -1,4 +1,4 @@
-# FAS 1050 PRO Vending Machine — Passive Listener
+# FAS 1050 PRO Vending Machine — Sales Listener
 
 Passiver Lauscher für den FAS 1050 PRO Vending-Automaten.
 **LiSPI (Listen Only, No Transmit)** — es werden KEINE Kommandos gesendet.
@@ -140,11 +140,13 @@ tail -f data/raw_stream.log
 | Eigenschaft | Wert |
 |-------------|------|
 | Automat | FAS 1050 PRO |
-| IP | 192.168.200.146 |
+| IP | X.X.X.X |
 | Port | TCP 8888 (Management-Interface) |
-| Port 8889 | Seriennummer (202425042) |
+| Port 8889 | Seriennummer |
 | Authentifizierung | Keine |
 | Protokoll | Reines ASCII, zeilenbasiert |
+
+> ⚠️ **Hinweis zur Erreichbarkeit:** Der Automat ist **nur im lokalen Netzwerk (LAN/WLAN)** erreichbar. Die IP muss in deiner eigenen Netzwerkkonfiguration ermittelt und in `fas1050_listener.py` als Konstante `AUTOMAT_HOST` eingetragen werden.
 
 ## Lizenz
 

@@ -1,0 +1,398 @@
+{
+  "10": {
+    "name": "Elfbar CR600 Apple Peach",
+    "category": "Vapes"
+  },
+  "11": {
+    "name": "HQD Hoova+ Strawberry Ice",
+    "category": "Vapes"
+  },
+  "12": {
+    "name": "HQD Hoova+ Blueberry",
+    "category": "Vapes"
+  },
+  "13": {
+    "name": "HQD Hoova+ Melone Passionsfrucht",
+    "category": "Vapes"
+  },
+  "14": {
+    "name": "Flerbar Peach Ice",
+    "category": "Vapes"
+  },
+  "15": {
+    "name": "Elfbar V2 Purple Razz Lemonade",
+    "category": "Vapes"
+  },
+  "16": {
+    "name": "Elfbar V2 Pink Lemonade",
+    "category": "Vapes"
+  },
+  "17": {
+    "name": "Flerbar Orange",
+    "category": "Vapes"
+  },
+  "18": {
+    "name": "Elfbar CR600 Alps Ice",
+    "category": "Vapes"
+  },
+  "19": {
+    "name": "Elfbar CR600 SB RB Lemon",
+    "category": "Vapes"
+  },
+  "20": {
+    "name": "Wunder Zahnstocher Cherry Menthol",
+    "category": "Zahnstocher"
+  },
+  "21": {
+    "name": "Oreo mini",
+    "category": "Snacks"
+  },
+  "22": {
+    "name": "KitKat Orig.",
+    "category": "Snacks"
+  },
+  "23": {
+    "name": "Mr. Bite Haselnuss Waffel",
+    "category": "Snacks"
+  },
+  "24": {
+    "name": "Skittles",
+    "category": "Snacks"
+  },
+  "25": {
+    "name": "Mr. Bite Snap",
+    "category": "Snacks"
+  },
+  "26": {
+    "name": "Willis Schoko togo",
+    "category": "Snacks"
+  },
+  "27": {
+    "name": "Black Choc Talk",
+    "category": "Snacks"
+  },
+  "28": {
+    "name": "Massiv Zahnstocher Peach Ice",
+    "category": "Zahnstocher"
+  },
+  "29": {
+    "name": "Massiv Blaulicht",
+    "category": "Zahnstocher"
+  },
+  "31": {
+    "name": "falcone American Cookie Cioko Latte 50g",
+    "category": "Snacks"
+  },
+  "33": {
+    "name": "Kinder Schoko Bons Crispy",
+    "category": "Snacks"
+  },
+  "35": {
+    "name": "hitschies Saure Drachenzungen Berry Mix 125g",
+    "category": "Snacks"
+  },
+  "37": {
+    "name": "hitschies Saure Drachenzungen Berry Mix 125g",
+    "category": "Snacks"
+  },
+  "39": {
+    "name": "Kinder Schoko Bons Crispy",
+    "category": "Snacks"
+  },
+  "40": {
+    "name": "Paulaner Limo Orange 330ml",
+    "category": "Getränke"
+  },
+  "41": {
+    "name": "Sprite 330ml",
+    "category": "Getränke"
+  },
+  "42": {
+    "name": "Sprite 330ml",
+    "category": "Getränke"
+  },
+  "43": {
+    "name": "Coca Cola Original Dose",
+    "category": "Getränke"
+  },
+  "44": {
+    "name": "Coca Cola Dose 330ml",
+    "category": "Getränke"
+  },
+  "45": {
+    "name": "Fanta Orange Dose",
+    "category": "Getränke"
+  },
+  "46": {
+    "name": "Fanta Lemon",
+    "category": "Getränke"
+  },
+  "47": {
+    "name": "Coca Cola Original Dose",
+    "category": "Getränke"
+  },
+  "48": {
+    "name": "Viva Pfirsich",
+    "category": "Getränke"
+  },
+  "49": {
+    "name": "Karuzo Chocolate Croissant",
+    "category": "Snacks"
+  },
+  "50": {
+    "name": "Durstlöscher Pfirsich",
+    "category": "Getränke"
+  },
+  "51": {
+    "name": "Volvic 500ml",
+    "category": "Getränke"
+  },
+  "52": {
+    "name": "Fresh Peach",
+    "category": "Getränke"
+  },
+  "53": {
+    "name": "Fresh Mango",
+    "category": "Getränke"
+  },
+  "54": {
+    "name": "Paulaner Limo Zitrone 330ml",
+    "category": "Getränke"
+  },
+  "55": {
+    "name": "Paulaner Cola 330ml",
+    "category": "Getränke"
+  },
+  "56": {
+    "name": "Paulaner Spezi Zero 330ml",
+    "category": "Getränke"
+  },
+  "57": {
+    "name": "I am Special Zero 330ml",
+    "category": "Getränke"
+  },
+  "58": {
+    "name": "I am Special Orange Mix 330ml",
+    "category": "Getränke"
+  },
+  "59": {
+    "name": "Paulaner Spezi 330ml",
+    "category": "Getränke"
+  },
+  "60": {
+    "name": "Hot Blood Pfirsich",
+    "category": "Getränke"
+  },
+  "61": {
+    "name": "Redbull White Peach 250ml",
+    "category": "Getränke"
+  },
+  "62": {
+    "name": "Red Bull Apricot 250ml",
+    "category": "Getränke"
+  },
+  "63": {
+    "name": "Red Bull Energy 250ml",
+    "category": "Getränke"
+  },
+  "64": {
+    "name": "Redbull Kokos Blueberry 250ml",
+    "category": "Getränke"
+  },
+  "65": {
+    "name": "Red Bull Kaktusfrucht",
+    "category": "Getränke"
+  },
+  "66": {
+    "name": "Red Bull Spring 250ml",
+    "category": "Getränke"
+  },
+  "67": {
+    "name": "Red Bull Blue 250ml",
+    "category": "Getränke"
+  },
+  "68": {
+    "name": "RedBull Summer 250ml",
+    "category": "Getränke"
+  },
+  "69": {
+    "name": "Red Bull Kaktusfrucht",
+    "category": "Getränke"
+  },
+  "111": {
+    "name": "Flerbar Grape",
+    "category": "Vapes"
+  },
+  "112": {
+    "name": "Flerbar Blueberry",
+    "category": "Vapes"
+  },
+  "113": {
+    "name": "Flerbar Chewy Watermelon",
+    "category": "Vapes"
+  },
+  "114": {
+    "name": "Flerbar Apple Ice",
+    "category": "Vapes"
+  },
+  "115": {
+    "name": "Elfbar CR600 Blue Razz Lemonade",
+    "category": "Vapes"
+  },
+  "116": {
+    "name": "HQD Hoova+ Blueberry Kiwi",
+    "category": "Vapes"
+  },
+  "117": {
+    "name": "Flerbar Pink Lemonade",
+    "category": "Vapes"
+  },
+  "118": {
+    "name": "Billy Boy Kondome 3er Sonstiges",
+    "category": "Sonstiges"
+  },
+  "121": {
+    "name": "Desire Forest",
+    "category": "Snacks"
+  },
+  "122": {
+    "name": "Snickers Waffle Rolls",
+    "category": "Snacks"
+  },
+  "123": {
+    "name": "Desire Dark",
+    "category": "Snacks"
+  },
+  "124": {
+    "name": "Ültje Erdnüsse togo",
+    "category": "Snacks"
+  },
+  "125": {
+    "name": "Haribo Tropifrutti mini",
+    "category": "Snacks"
+  },
+  "126": {
+    "name": "Muster Getränk 7%",
+    "category": "Getränke"
+  },
+  "127": {
+    "name": "Kinder Schoko-Bon Crispy 4Stk",
+    "category": "Snacks"
+  },
+  "128": {
+    "name": "Orbit Kaugummi White",
+    "category": "Snacks"
+  },
+  "131": {
+    "name": "Schnipfelspeck 200g Food",
+    "category": "Metzgerei"
+  },
+  "133": {
+    "name": "Bergen Matcha Pralines",
+    "category": "Snacks"
+  },
+  "135": {
+    "name": "Lyoner 200g Food",
+    "category": "Metzgerei"
+  },
+  "137": {
+    "name": "Leberwurst 200g Food",
+    "category": "Metzgerei"
+  },
+  "141": {
+    "name": "Landjäger 1 Paar Food",
+    "category": "Metzgerei"
+  },
+  "142": {
+    "name": "Schinken 100g Food",
+    "category": "Metzgerei"
+  },
+  "143": {
+    "name": "Pfefferbeisser 3 Paar Food",
+    "category": "Metzgerei"
+  },
+  "144": {
+    "name": "Bauchspeck 100g Food",
+    "category": "Metzgerei"
+  },
+  "145": {
+    "name": "Bauernwurst 1 Paar Food",
+    "category": "Metzgerei"
+  },
+  "146": {
+    "name": "Merguez Food",
+    "category": "Metzgerei"
+  },
+  "147": {
+    "name": "Rote Bratwürste 1-Paar Food",
+    "category": "Metzgerei"
+  },
+  "148": {
+    "name": "Käsegriller 1P Food",
+    "category": "Metzgerei"
+  },
+  "151": {
+    "name": "Hitschis Saure Spinnenbeine",
+    "category": "Snacks"
+  },
+  "152": {
+    "name": "Capri Sun Cola",
+    "category": "Getränke"
+  },
+  "153": {
+    "name": "Capri Sun Multivitamin",
+    "category": "Getränke"
+  },
+  "154": {
+    "name": "Capri Sonne Kirsch 200ml",
+    "category": "Getränke"
+  },
+  "155": {
+    "name": "Capri Sun Orange",
+    "category": "Getränke"
+  },
+  "156": {
+    "name": "Bergen Matcha Cookies",
+    "category": "Snacks"
+  },
+  "157": {
+    "name": "Prince Roll",
+    "category": "Snacks"
+  },
+  "158": {
+    "name": "Tabby Crunch",
+    "category": "Snacks"
+  },
+  "161": {
+    "name": "Muster Getränk 7%",
+    "category": "Getränke"
+  },
+  "162": {
+    "name": "Heineken Lager 330ml",
+    "category": "Getränke"
+  },
+  "163": {
+    "name": "Warsteiner Pils 500ml",
+    "category": "Getränke"
+  },
+  "164": {
+    "name": "Heineken 0/0",
+    "category": "Getränke"
+  },
+  "165": {
+    "name": "Heineken Lager 330ml",
+    "category": "Getränke"
+  },
+  "166": {
+    "name": "Rockstar Original",
+    "category": "Getränke"
+  },
+  "167": {
+    "name": "Desperados Original",
+    "category": "Getränke"
+  },
+  "168": {
+    "name": "Jim Beam Cola 330ml",
+    "category": "Getränke"
+  }
+}
