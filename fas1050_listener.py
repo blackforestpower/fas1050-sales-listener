@@ -462,6 +462,7 @@ last_erog_time = 0        # epoch seconds
 
 # Für Preisermittlung bei erog / take
 sale_credit_before = 0    # Kredit-Wert bei erog
+sale_credit_during_erog = 0  # Niedrigster positiver Kredit während erog (für Cash-Rückgeld-Erkennung)
 sale_is_card = False      # Wurde 4900 (Karte) gesehen?
 
 
@@ -493,21 +494,30 @@ def detect_sale(line, parsed, state):
     """
     global last_credit_count, sale_in_progress, sale_price_cent
     global current_sale_slot, last_erog_time
-    global sale_credit_before, sale_is_card
+    global sale_credit_before, sale_credit_during_erog, sale_is_card
 
     now = datetime.now()
 
     cmd = parsed.get("command", "")
 
     # ── Slot-Erkennung: select <rack> <slot> ... ────────
-    if cmd.startswith("select "):
+    # ACHTUNG: cmd enthält Timestamp vorne, also "[2026-06-08 07:26:11] select 0 64 0 0"
+    # Deshalb prüfen wir "select" in cmd statt startswith!
+    if "select " in cmd:
         parts = cmd.split()
-        if len(parts) >= 3:
-            rack = int(parts[1])
-            slot_num = int(parts[2])
-            current_sale_slot = str(rack * 100 + slot_num)
-            # viewprice zurücksetzen (neue Auswahl)
-            sale_price_cent = 0
+        # Finde das "select" in der Mitte
+        for i, p in enumerate(parts):
+            if p == "select" and i + 2 < len(parts):
+                try:
+                    rack = int(parts[i+1])
+                    slot_num = int(parts[i+2])
+                    current_sale_slot = str(rack * 100 + slot_num)
+                except (ValueError, IndexError):
+                    pass
+                break
+            # viewprice NICHT zurücksetzen bei wiederholtem select!
+            # Der Automat sendet select oft beim Preis-Anzeigen nochmal.
+            # Wir lassen sale_price_cent stehen, kommt von viewprice.
 
     # ── viewprice: Preis merken (NUR bei Cash relevant) ──
     if "selstate" in cmd:
@@ -519,12 +529,19 @@ def detect_sale(line, parsed, state):
             if vp and 1 <= vp <= 10000:
                 sale_price_cent = vp
 
-    # ── readcredit 4900 = Karte erkannt ───────────────
+    # ── readcredit: Karte erkennen + Cash-Kredit-Tracking ──
     if "readcredit" in cmd:
         cu = parsed.get("credit_units", 0)
-        if cu == 4900 and not sale_in_progress:
+        if cu == 4900:
             sale_is_card = True
-            log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
+            if not sale_in_progress:
+                log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
+        
+        # Bei Cash: kleinsten positiven Kredit während erog merken
+        # (für Rückgeld-Erkennung: 500→250→0 → Preis=500-250=250)
+        if sale_in_progress and not sale_is_card:
+            if 0 < cu < sale_credit_during_erog or sale_credit_during_erog == 0:
+                sale_credit_during_erog = cu
 
     # ── selstate Continue für erog/take ─────────────────
     if "selstate" in cmd:
@@ -540,6 +557,7 @@ def detect_sale(line, parsed, state):
                     # Kredit-Vorher: LIVE aus aktuellen Automaten-Daten
                     credit = state.get("credit", {})
                     sale_credit_before = credit.get("units", 0) or 0
+                    sale_credit_during_erog = sale_credit_before
                     sale_is_card = (sale_credit_before == 4900)
                     
                     log(f"🛒  VERKAUF ({current_sale_slot or '?'}) | "
@@ -574,23 +592,19 @@ def detect_sale(line, parsed, state):
                         
                         # Fallback: Kredit-Differenz (wenn viewprice mal fehlt)
                         if not price:
-                            credit = state.get("credit", {})
-                            sale_credit_after = credit.get("units", 0) or 0
-                            diff = sale_credit_before - sale_credit_after
-                            # Bei Cash: z.B. 500 - 250 = 250 (Rückgeld 250, Preis 250)
-                            # oder: 250 - 0 = 250 (exakt bezahlt)
-                            if 1 <= diff <= 10000:
-                                # ABER: bei 5€-Schein + 2.50€ Rückgeld ist diff = 500-250=250
-                                # bei exakter Zahlung: diff = 250-0=250
-                                # Beide Fälle: diff = 250 = korrekt!
-                                # Rückgeld-Fall: credit_after=250, diff=250 (nicht der Preis!)
-                                # Lösung: bei Cash ist der Kredit-Verlauf: 
-                                # vorher 500, nach take 0 oder whatever
-                                # Der PREIS ist: Kredit_davor - Kredit_waehrend_erog
-                                # ODER einfacher: viewprice!
-                                log(f"   ⚠️  Cash-Fallback: Kredit-Diff {diff} (bp={sale_credit_before}→{sale_credit_after})")
+                            # Fall 1: Rückgeld (z.B. 500€ → 250€ Rest → 0€):
+                            #   credit_during_erog = 250, diff = 500-250 = 250 ✅
+                            diff = sale_credit_before - sale_credit_during_erog
+
+                            # Fall 2: Exakte Zahlung (z.B. 250 → 250 → 0):
+                            #   credit_during_erog = 250 (gleich wie before) = der Preis!
+                            if diff == 0 and sale_credit_during_erog > 0:
+                                diff = sale_credit_during_erog
+
+                            if 1 <= diff <= 1000:
+                                log(f"   Cash-Fallback: {sale_credit_before} - {sale_credit_during_erog} = {diff} Cent")
                                 price = diff
-                        
+
                         if price:
                             log(f"   💵 Preis: {price} Cent (viewprice={sale_price_cent})")
 
@@ -640,6 +654,7 @@ def detect_sale(line, parsed, state):
                         sale_in_progress = False
                         sale_price_cent = 0
                         sale_is_card = False
+                        sale_credit_during_erog = 0
                         current_sale_slot = None
                     else:
                         log(f"⏭  take/enderog ohne Preis - ignoriert")
