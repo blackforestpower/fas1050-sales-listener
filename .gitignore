@@ -5,7 +5,7 @@ data/raw_stream.log
 data/raw_stream.log.*
 
 # Secrets
-.telegram_token
+.env
 
 # Python
 __pycache__/
@@ -13,4 +13,4 @@ __pycache__/
 *.pyo
 
 # Backups
-backup/
+backups/
