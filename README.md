@@ -151,4 +151,4 @@ tail -f data/raw_stream.log
 
 ## Lizenz
 
-Projekt von Camiro Bot — Kann bei GitHub veröffentlicht werden.
+Projekt für GitHub veröffentlicht.
