@@ -1,11 +1,8 @@
-# Data (live logging, wird nicht versioniert)
-data/current_state.json
-data/events.jsonl
-data/raw_stream.log
-data/raw_stream.log.*
-
 # Secrets
 .env
+
+# Data (live logging, wird nicht versioniert)
+data/
 
 # Python
 __pycache__/
