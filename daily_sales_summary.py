@@ -16,6 +16,12 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone, date
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
