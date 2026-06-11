@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tageszusammenfassung der Automaten-Verkäufe.
+Tageszusammenfassung der Automaten-Verkäufe (SQLite-Version).
 
 Modi:
   A) Täglicher Report um 6:00 Uhr → Umsätze von 06:00 Vortag bis 05:59 heute
@@ -11,10 +11,10 @@ Aufruf:
   python3 daily_sales_summary.py --today     → Modus B (heute 00:00 – jetzt)
 """
 
-import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone, date
+import sqlite3
+from datetime import datetime, timedelta
 
 try:
     from dotenv import load_dotenv
@@ -24,8 +24,7 @@ except ImportError:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
-CATALOG_FILE = os.path.join(DATA_DIR, "product_catalog.json")
+DB_FILE = os.path.join(DATA_DIR, "sales.db")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
@@ -55,54 +54,46 @@ def telegram_send(msg):
         print(f"⚠️  Telegram-Fehler: {e}", file=sys.stderr)
 
 
-def load_catalog():
-    try:
-        with open(CATALOG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def load_sales():
-    sales = []
-    try:
-        with open(EVENTS_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if ev.get("type") == "sale":
-                    data = ev.get("data", {})
-                    sales.append({
-                        "time": ev.get("time", ""),
-                        "slot": data.get("slot"),
-                        "price_cent": data.get("price_cent"),
-                        "price_eur": data.get("price_eur"),
-                    })
-    except FileNotFoundError:
-        pass
-    return sales
-
-
-def get_utc_offset():
-    import time
-    return 2 if time.localtime().tm_isdst else 1
-
-
-def build_report(sales, catalog, start_local, end_local, title_prefix):
-    """Erzeuge Report-String aus gefilterten Sales.
-    start_local, end_local = datetime-Objekte in Berliner Lokalzeit
-    Events in events.jsonl sind in lokaler Berliner Zeit (CEST).
+def load_sales(start_local, end_local):
+    """
+    Lädt Verkäufe aus der SQLite-DB im angegebenen Zeitraum.
+    start_local, end_local = datetime-Objekte in Berliner Lokalzeit.
+    Die DB speichert Timestamps als ISO-Strings in Lokalzeit.
     """
     start_str = start_local.strftime("%Y-%m-%dT%H:%M:%S")
     end_str = end_local.strftime("%Y-%m-%dT%H:%M:%S")
 
-    filtered = [s for s in sales if start_str <= s.get("time", "") < end_str]
-    if not filtered:
+    if not os.path.exists(DB_FILE):
+        return []
+
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        cursor = conn.execute(
+            "SELECT timestamp, slot, product, category, price_eur, payment FROM sales WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+            (start_str, end_str)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        sales = []
+        for ts, slot, product, category, price_eur, payment in rows:
+            sales.append({
+                "time": ts,
+                "slot": slot,
+                "product": product or "?",
+                "category": category or "?",
+                "price_eur": price_eur,
+                "payment": payment,
+            })
+        return sales
+    except Exception as e:
+        print(f"⚠️  DB-Fehler: {e}", file=sys.stderr)
+        return []
+
+
+def build_report(sales, start_local, end_local, title_prefix):
+    """Erzeuge Report-String aus gefilterten Sales."""
+    if not sales:
         msg = (
             f"📊 <b>{title_prefix}</b>\n"
             f"🗓 {start_local.strftime('%d.%m')} {start_local.strftime('%H:%M')} – {end_local.strftime('%d.%m')} {end_local.strftime('%H:%M')}\n\n"
@@ -110,18 +101,27 @@ def build_report(sales, catalog, start_local, end_local, title_prefix):
         )
         return msg, 0, 0.0
 
-    total_cent = 0
-    slot_sales = {}
-    for s in filtered:
-        slot = s.get("slot", "?")
-        price = s.get("price_cent") or 0
-        total_cent += price
-        if slot not in slot_sales:
-            cat = catalog.get(str(slot), {}).get("category", "?")
-            name = catalog.get(str(slot), {}).get("name", "")
-            slot_sales[slot] = {"count": 0, "total_cent": 0, "name": name, "cat": cat}
-        slot_sales[slot]["count"] += 1
-        slot_sales[slot]["total_cent"] += price
+    total_cent = int(sum(s["price_eur"] for s in sales) * 100 + 0.5)
+
+    # Nach Kategorie gruppieren
+    cat_data = {}
+    slot_details = {}
+    for s in sales:
+        cat = s.get("category") or "?"
+        slot = s.get("slot") or "?"
+        product = s.get("product") or ""
+        price_cent = int(s["price_eur"] * 100 + 0.5)
+
+        if cat not in cat_data:
+            cat_data[cat] = {"count": 0, "total_cent": 0}
+        cat_data[cat]["count"] += 1
+        cat_data[cat]["total_cent"] += price_cent
+
+        key = (cat, slot)
+        if key not in slot_details:
+            slot_details[key] = {"count": 0, "total_cent": 0, "name": product if product != "?" else ""}
+        slot_details[key]["count"] += 1
+        slot_details[key]["total_cent"] += price_cent
 
     total_eur = total_cent / 100.0
     lines = [
@@ -129,31 +129,24 @@ def build_report(sales, catalog, start_local, end_local, title_prefix):
         f"🗓 {start_local.strftime('%d.%m')} {start_local.strftime('%H:%M')} – {end_local.strftime('%d.%m')} {end_local.strftime('%H:%M')}",
         "",
         f"💰 <b>Umsatz: {total_eur:.2f}€</b>",
-        f"🛒 Verkäufe: {len(filtered)}",
+        f"🛒 Verkäufe: {len(sales)}",
         "",
     ]
 
     cat_order = ["Getränke", "Snacks", "Vapes", "Zahnstocher", "Metzgerei", "Sonstiges"]
-    cat_data = {}
-    for slot, info in slot_sales.items():
-        c = info["cat"]
-        if c not in cat_data:
-            cat_data[c] = {"count": 0, "total_cent": 0, "items": []}
-        cat_data[c]["count"] += info["count"]
-        cat_data[c]["total_cent"] += info["total_cent"]
-        cat_data[c]["items"].append((slot, info))
-
     for cat in cat_order:
         cd = cat_data.get(cat)
         if not cd:
             continue
         lines.append(f"<b>{cat}</b> ({cd['count']}x, {cd['total_cent']/100:.2f}€)")
-        for slot, info in sorted(cd["items"], key=lambda x: int(x[0]) if x[0].isdigit() else 999):
-            name_str = f" — {info['name']}" if info["name"] else ""
+        for (c, slot), info in sorted(slot_details.items(), key=lambda x: int(x[0][1]) if x[0][1].isdigit() else 999):
+            if c != cat:
+                continue
+            name_str = f" — {info['name']}" if info['name'] else ""
             lines.append(f"  📍 Slot {slot}{name_str}: {info['count']}x ({info['total_cent']/100:.2f}€)")
         lines.append("")
 
-    return "\n".join(lines).strip(), len(filtered), total_eur
+    return "\n".join(lines).strip(), len(sales), total_eur
 
 
 def mode_a():
@@ -164,25 +157,20 @@ def mode_a():
         today6 -= timedelta(days=1)
     start = today6 - timedelta(days=1)
     end = today6
-    return build_report(sales, catalog, start, end, "Automaten-Zusammenfassung"), start, end
+    sales = load_sales(start, end)
+    return build_report(sales, start, end, "Automaten-Zusammenfassung"), start, end
 
 
 def mode_b():
-    """Tagesumsatz: heute 00:00 – jetzt (Berliner Zeit)
-    Wichtig: Events in events.jsonl sind UTC! Wir wandeln lokal->UTC um.
-    """
+    """Tagesumsatz: heute 00:00 – jetzt"""
     now_local = datetime.now()
     today0_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return build_report(sales, catalog, today0_local, now_local, "Heutiger Tagesumsatz"), today0_local, now_local
-
-
-# Globale Ladevorgänge (damit modes darauf zugreifen können)
-catalog = load_catalog()
-sales = load_sales()
+    sales = load_sales(today0_local, now_local)
+    return build_report(sales, today0_local, now_local, "Heutiger Tagesumsatz"), today0_local, now_local
 
 
 def main():
-    mode = "A"  # default = täglicher Report
+    mode = "A"
     if "--today" in sys.argv or "-t" in sys.argv:
         mode = "B"
 
