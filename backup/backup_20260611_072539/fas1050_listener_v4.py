@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║             FAS 1050 PRO Vending Machine Listener            ║
+║             VaS 1050 Vending Machine Listener                ║
 ║                                                              ║
 ║  LiSPI (listen only, no transmit) — PASSIVER LAUSCHER        ║
-║  Verbindet sich zum FAS 1050 PRO Automaten und zeichnet alle ║
+║  Verbindet sich zum VaS 1050 Automaten und zeichnet alle     ║
 ║  Daten auf, die der Automat von sich aus sendet.             ║
 ║                                                              ║
 ║  KEINE Kommandos werden gesendet — nur mithören!             ║
@@ -12,7 +12,7 @@
 
 PROTOKOLL-BESCHREIBUNG:
 ========================
-Der FAS 1050 PRO (FAS International) sendet auf TCP-Port 8888
+Der VaS 1050 (FAS International) sendet auf TCP-Port 8888
 kontinuierlich Statusdaten im Klartext (ASCII). Die Verbindung
 ist unidirektional — der Automat pusht, der Client lauscht nur.
 
@@ -48,15 +48,15 @@ Bekannte Befehle:
 AUSGABEDATEIEN:
 ───────────────
     current_state.json   → Aktueller Zustand (wird überschrieben)
-    events.jsonl           → Relevante Ereignisse (Verkäufe, Zustandswechsel)
+    sales.db             → SQLite-Datenbank mit allen Verkäufen
     raw_stream.log        → Rohdaten (jede Zeile mit Zeitstempel)
 
 INSTALLATION (systemd):
 ───────────────────────
-    sudo cp fas1050-listener.service /etc/systemd/system/
+    sudo cp vas1050-listener.service /etc/systemd/system/
     sudo systemctl daemon-reload
-    sudo systemctl enable fas1050-listener.service
-    sudo systemctl start fas1050-listener.service
+    sudo systemctl enable vas1050-listener.service
+    sudo systemctl start vas1050-listener.service
 """
 
 import socket
@@ -64,41 +64,38 @@ import json
 import time
 import os
 import sys
+import sqlite3
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-# ─── .env LADEN ──────────────────────────────────────────────
-from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-
 # ─── KONFIGURATION ────────────────────────────────────────────
-# Alle Konfiguration via .env Datei (siehe .env.example)
-HOST = os.environ.get("VAS1050_HOST", "X.X.X.X")
-PORT = int(os.environ.get("VAS1050_PORT", "8888"))
-RECONNECT_DELAY = int(os.environ.get("VAS1050_RECONNECT_DELAY", "5"))
+HOST = "192.168.200.146"         # IP des VaS 1050 Automaten
+PORT = 8888                       # TCP-Port (Management-Interface)
+RECONNECT_DELAY = 5               # Sekunden bis zum Wiederverbinden
 
 # ─── TELEGRAM ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_TRADING_GROUP = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "")
+TELEGRAM_TRADING_GROUP = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "-5134447945")
 TELEGRAM_ENABLED = True
 
-# Fallback: Falls keine .env oder Env-Variablen vorhanden,
-# Token aus Datei .telegram_token laden
+# Fallback: Falls Environment-Variablen nicht gesetzt,
+# Token aus externer Datei laden (damit nicht im Code sichtbar)
 if not TELEGRAM_BOT_TOKEN:
     token_file = os.path.join(os.path.dirname(__file__), ".telegram_token")
     try:
         with open(token_file) as f:
             TELEGRAM_BOT_TOKEN = f.read().strip()
     except FileNotFoundError:
-        log("⚠️  Kein Telegram-Token gefunden (weder ENV, .env noch Datei)")
+        pass  # Telegram deaktiviert – wird später geloggt
 # ──────────────────────────────────────────────────────────────
+
+# Test-Modus (wird von tests/test_sales_simulation.py gesetzt)
+TEST_MODE_SOURCE = None  # None = normal, "test_simulation" = Test-Einträge
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 STATE_FILE = os.path.join(DATA_DIR, "current_state.json")
-EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
 RAW_FILE = os.path.join(DATA_DIR, "raw_stream.log")
-SALES_FILE = os.path.join(DATA_DIR, "sales.jsonl")
 CATALOG_FILE = os.path.join(DATA_DIR, "product_catalog.json")
 # ──────────────────────────────────────────────────────────────
 
@@ -166,6 +163,58 @@ def load_prices_from_log():
     log(f"🏷  Geladene Preise aus Log: {len(prices)} Slots")
     return prices
 
+
+# ─── SQLite Sales-DB ──────────────────────────────────────────
+DB_FILE = os.path.join(DATA_DIR, "sales.db")
+_CATALOG_CACHE = {}  # wird beim Start geladen
+
+
+def _ensure_sales_table():
+    """Stellt sicher, dass die sales-Tabelle existiert (einmalig beim Start)"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sales (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                slot        TEXT,
+                product     TEXT,
+                category    TEXT,
+                price_cent  INTEGER NOT NULL,
+                price_eur   REAL NOT NULL,
+                payment     TEXT NOT NULL,
+                credit_before INTEGER,
+                source      TEXT DEFAULT 'listener'
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"⚠️  DB-Fehler (init): {e}")
+
+
+def write_sale_to_db(ts, slot, price_cent, price_eur, payment, credit_before):
+    """Schreibt einen Sale in die SQLite-DB (Fehler tolerant)"""
+    try:
+        product = ""
+        category = ""
+        if slot and slot in _CATALOG_CACHE:
+            product = _CATALOG_CACHE[slot].get("name", "")
+            category = _CATALOG_CACHE[slot].get("category", "")
+        
+        source = TEST_MODE_SOURCE if TEST_MODE_SOURCE else "listener"
+        
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        conn.execute(
+            "INSERT INTO sales (timestamp, slot, product, category, price_cent, price_eur, payment, credit_before, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, slot, product, category, price_cent, price_eur, payment, credit_before, source)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"⚠️  DB-Fehler (write_sale): {e}")
+
+# ──────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════
 #  HELFER
@@ -240,12 +289,14 @@ def parse_line(line):
         # ── Verkaufsstatus ─────────────────────────────────
         elif "selstate" in cmd:
             result["state"] = values[0] if values else "unknown"
-            # viewprice: Preis steht in values[1] (z.B. "viewprice 250")
-            if "viewprice" in result["state"] and len(values) >= 2:
-                try:
-                    result["viewprice_cent"] = int(values[1])
-                except ValueError:
-                    pass
+            # viewprice kann "viewprice 250" enthalten → Preis extrahieren
+            if "viewprice" in result["state"]:
+                parts = result["state"].split()
+                if len(parts) >= 2:
+                    try:
+                        result["viewprice_cent"] = int(parts[1])
+                    except ValueError:
+                        pass
 
         # ── Guthaben / Verkaufszähler ──────────────────────
         elif "readcredit" in cmd and len(values) >= 2:
@@ -342,9 +393,7 @@ def process_line(line, state, last_state):
             changed = True
             log(f"⚠️  Fehler: Byte={err['byte']} Code={err['code']} "
                 f"Count={err['count']}")
-            # Fehler-Events in events.jsonl (nur wenn Count > 0)
-            if err["count"] > 0:
-                save_event(state, event_type="error", event_data=err)
+
 
     # ── Verkaufsstatus ─────────────────────────────────────
     elif "selstate" in cmd:
@@ -381,7 +430,6 @@ def process_line(line, state, last_state):
     if changed:
         state["last_seen"] = datetime.now().isoformat()
         save_state(state)
-        save_event(state)
 
     # Verkaufserkennung + Telegram (bei jeder readcredit-Zeile)
     detect_sale(line, parsed, state)
@@ -391,47 +439,6 @@ def save_state(state):
     """Aktuellen Zustand als JSON speichern (immer überschreiben)"""
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
-
-
-def save_event(state, event_type="state_change", event_data=None):
-    """
-    Schreibt relevante Ereignisse in events.jsonl.
-    
-    event_type: "state_change" (Standard), "sale", "credit", "error"
-    event_data: Zusätzliche Infos (z.B. Verkaufsdaten)
-    """
-    entry = {
-        "timestamp": state["last_seen"],
-        "temperatures": state.get("temperatures"),
-        "errors": state.get("errors"),
-        "selstate": state.get("selstate"),
-        "credit": state.get("credit"),
-        "clock": state.get("clock"),
-        "slot_count": len(state.get("prices", {})),
-    }
-    
-    # events.jsonl: NUR relevante Ereignisse
-    # - sale/error: immer
-    # - state_change: nur wenn nicht in enderog-Idle (Verkaufsphase)
-    keep = False
-    if event_type != "state_change":
-        keep = True  # sale, error
-    else:
-        sel = entry.get("selstate", "")
-        if sel not in ("enderog", "viewprice", None, ""):
-            keep = True
-
-    if keep:
-        event_entry = {
-            "time": state["last_seen"],
-            "type": event_type,
-            "state": entry
-        }
-        if event_data:
-            event_entry["data"] = event_data
-        with open(EVENTS_FILE, "a") as f:
-            f.write(json.dumps(event_entry, ensure_ascii=False) + "\n")
-
 
 # ═══════════════════════════════════════════════════════════════
 #  SALES DETECTION + TELEGRAM
@@ -466,16 +473,12 @@ last_erog_time = 0        # epoch seconds
 
 # Für Preisermittlung bei erog / take
 sale_credit_before = 0    # Kredit-Wert bei erog
-sale_credit_during_erog = 0  # Niedrigster positiver Kredit während erog (für Cash-Rückgeld-Erkennung)
 sale_is_card = False      # Wurde 4900 (Karte) gesehen?
 
 
 def telegram_send(text):
     """Sendet eine Nachricht an die Trading-Gruppe via Bot-API"""
     if not TELEGRAM_ENABLED:
-        return
-    if not TELEGRAM_TRADING_GROUP:
-        log("⚠️  Keine Telegram-Chat-ID konfiguriert – Nachricht nicht gesendet")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -495,242 +498,177 @@ def detect_sale(line, parsed, state):
     """
     Erkennt VERKÄUFE anhand der Protokoll-Sequenz.
     
-    Verkaufsabläufe (nach raw_stream-Beobachtung):
-    1. 💵 Cash + viewprice:  select → viewprice X → readcredit 500 → erog → readcredit 250→0 → take
-    2. 💳 Karte + viewprice:  select → viewprice X → readcredit 4900 → erog → readcredit 0 → enderog|take
-    3. 💳 Karte + AgeProt:    select → ageprotection → (select neu) → readcredit 4900 → erog → take
-    4. ⛔ Abbruch:            ... → other → enderog
-    
-    Preis-Ermittlung:
-    1. Wahl: Slot-Preis-Tabelle (state["prices"]) – wenn vorhanden
-    2. Wahl: viewprice (vom Automaten-Display, live)
-    3. Wahl: Credit-Differenz (Cash: Einwurf−Ausgabe, max 10€)
-    4. Wahl: nix → ignorieren
+    Zwei Prozesse:
+    💳 KARTE (credit_before = 4900) → Preis aus Slot-Tabelle
+    💵 CASH (credit_before < 4900) → Preis aus viewprice
     """
     global last_credit_count, sale_in_progress, sale_price_cent
     global current_sale_slot, last_erog_time
-    global sale_credit_before, sale_credit_during_erog, sale_is_card
+    global sale_credit_before, sale_is_card
 
     now = datetime.now()
+
     cmd = parsed.get("command", "")
 
     # ── Slot-Erkennung: select <rack> <slot> ... ────────
-    if "select " in cmd:
+    if cmd.startswith("select "):
         parts = cmd.split()
-        for i, p in enumerate(parts):
-            if p == "select" and i + 2 < len(parts):
-                try:
-                    rack = int(parts[i+1])
-                    slot_num = int(parts[i+2])
-                    current_sale_slot = str(rack * 100 + slot_num)
-                    # Bei neuem Select: alten viewprice ungültig machen
-                    sale_price_cent = 0
-                except (ValueError, IndexError):
-                    pass
-                break
+        if len(parts) >= 3:
+            rack = int(parts[1])
+            slot_num = int(parts[2])
+            current_sale_slot = str(rack * 100 + slot_num)
+            # viewprice zurücksetzen (neue Auswahl)
+            sale_price_cent = 0
 
-    # ── viewprice: Live-Preis vom Automaten-Display ──────
+    # ── viewprice: Preis merken (NUR bei Cash relevant) ──
     if "selstate" in cmd:
         new_state = parsed.get("state", "")
+
         if new_state.startswith("viewprice"):
+            # viewprice-Preis kommt jetzt korrekt aus dem Parser
             vp = parsed.get("viewprice_cent", 0)
             if vp and 1 <= vp <= 10000:
                 sale_price_cent = vp
 
-    # ── readcredit: Karte erkennen + Credit-Tracking ────
+    # ── readcredit 4900 = Karte erkannt ───────────────
     if "readcredit" in cmd:
         cu = parsed.get("credit_units", 0)
-        if cu == 4900:
-            if not sale_is_card:
-                sale_is_card = True
-                log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
-        
-        # Kredit während erog merken (für Cash-Rückgeld)
-        if sale_in_progress:
-            # Bei Karte: nur positiven Kredit-Wert merken (0 ignorieren)
-            if sale_is_card:
-                if 0 < cu < sale_credit_during_erog or sale_credit_during_erog == 0:
-                    sale_credit_during_erog = cu
-            else:
-                # Bei Cash: niedrigsten positiven Wert merken
-                if 0 < cu < sale_credit_during_erog or sale_credit_during_erog == 0:
-                    sale_credit_during_erog = cu
+        if cu == 4900 and not sale_in_progress:
+            sale_is_card = True
+            log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
 
-    # ── Selstate-Verarbeitung ────────────────────────────
+    # ── selstate Continue für erog/take ─────────────────
     if "selstate" in cmd:
         new_state = parsed.get("state", "")
 
-        # 🔥 erog = Ausgabe-Walze läuft → Verkauf erkannt
+        # 🔥 Echter Verkauf: erog = Ausgabe läuft!
         if new_state.startswith("erog"):
-            if time.time() - last_erog_time > 3:  # Sprinkler-Schutz
+            if time.time() - last_erog_time > 3:
                 last_erog_time = time.time()
                 if not sale_in_progress:
                     sale_in_progress = True
+                    
+                    # Kredit-Vorher: LIVE aus aktuellen Automaten-Daten
                     credit = state.get("credit", {})
                     sale_credit_before = credit.get("units", 0) or 0
-                    sale_credit_during_erog = sale_credit_before
-                    # Karte schon vor erog erkannt? Nein, beim erog nochmal prüfen
-                    if sale_credit_before == 4900:
-                        sale_is_card = True
+                    sale_is_card = (sale_credit_before == 4900)
                     
                     log(f"🛒  VERKAUF ({current_sale_slot or '?'}) | "
                         f"viewprice={sale_price_cent or '?'} Cent | "
                         f"credit_before={sale_credit_before} | "
                         f"{'💳 Karte' if sale_is_card else '💵 Cash'}")
 
-        # ❌ other = Abbruch/Störung → Sale verwerfen
-        if new_state.startswith("other"):
+        # 🔚 Verkauf abgeschlossen: take unlock
+        if new_state.startswith("take"):
             if sale_in_progress:
-                log(f"⛔ VERKAUF ABGEBROCHEN (other) - reset")
-                _reset_sale()
-                return
-
-        # 🏁 take/enderog = Verkauf abgeschlossen
-        if new_state.startswith("take") or new_state.startswith("enderog"):
-            if sale_in_progress:
-                # Nur Sales innerhalb 45s nach erog (sonst stale)
                 if time.time() - last_erog_time < 45:
-                    price = _get_sale_price(state)
+                    # PREIS ERMITTELN
+                    price = None
+                    
+                    if sale_is_card:
+                        # 💳 KARTE: Preis aus Slot-Tabelle
+                        slot_idx = str(current_sale_slot) if current_sale_slot else None
+                        prices = state.get("prices", {})
+                        if slot_idx and slot_idx in prices:
+                            p_entry = prices[slot_idx]
+                            if isinstance(p_entry, dict) and "price_cent" in p_entry:
+                                price = p_entry["price_cent"]
+                            elif isinstance(p_entry, (int, float)):
+                                price = int(p_entry)
+                        if price:
+                            log(f"   💳 Preis aus Slot-Tabelle: {price} Cent")
+                        else:
+                            log(f"   ⚠️  Karte aber kein Slot-Preis für {slot_idx}")
+                    else:
+                        # 💵 CASH: Preis aus viewprice
+                        price = sale_price_cent if sale_price_cent > 0 else None
+                        
+                        # Fallback: Kredit-Differenz (wenn viewprice mal fehlt)
+                        if not price:
+                            credit = state.get("credit", {})
+                            sale_credit_after = credit.get("units", 0) or 0
+                            diff = sale_credit_before - sale_credit_after
+                            # Bei Cash: z.B. 500 - 250 = 250 (Rückgeld 250, Preis 250)
+                            # oder: 250 - 0 = 250 (exakt bezahlt)
+                            if 1 <= diff <= 10000:
+                                # ABER: bei 5€-Schein + 2.50€ Rückgeld ist diff = 500-250=250
+                                # bei exakter Zahlung: diff = 250-0=250
+                                # Beide Fälle: diff = 250 = korrekt!
+                                # Rückgeld-Fall: credit_after=250, diff=250 (nicht der Preis!)
+                                # Lösung: bei Cash ist der Kredit-Verlauf: 
+                                # vorher 500, nach take 0 oder whatever
+                                # Der PREIS ist: Kredit_davor - Kredit_waehrend_erog
+                                # ODER einfacher: viewprice!
+                                log(f"   ⚠️  Cash-Fallback: Kredit-Diff {diff} (bp={sale_credit_before}→{sale_credit_after})")
+                                price = diff
+                        
+                        if price:
+                            log(f"   💵 Preis: {price} Cent (viewprice={sale_price_cent})")
 
                     if price and price > 0:
-                        _finalize_sale(state, price, now)
-                    else:
-                        log(f"⏭  {new_state} ohne Preis - ignoriert")
-                else:
-                    log(f"⏭  {new_state} ohne erog in 45s - ignoriert")
+                        slot_str = f"Slot {current_sale_slot}" if current_sale_slot else "unbekannt"
+                        amount_eur = price / 100.0
 
-    # ── Kredit-Log (nur bei Änderung) ────────────────────
+                        temps = state.get("temperatures", {})
+                        z1 = temps.get("zone1", "?")
+                        z2 = temps.get("zone2", "?")
+
+                        payment_method = "💳 Karte" if sale_is_card else "💵 Cash"
+
+                        # Produktname aus Katalog (falls vorhanden)
+                        product_name = None
+                        if current_sale_slot:
+                            cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
+                            if cat_entry:
+                                product_name = cat_entry.get("name")
+
+                        msg = (
+                            f"🛒 <b>Verkauf am Automaten! ({now.strftime('%H:%M')} Uhr)</b>\n"
+                            f"💰 {amount_eur:.2f}€ {payment_method}\n"
+                            f"📍 {slot_str}"
+                        )
+                        if product_name:
+                            msg += f" — {product_name}\n"
+                        else:
+                            msg += "\n"
+                        msg += (
+                            f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
+                        )
+                        telegram_send(msg)
+                        log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str}")
+                        
+                        # Sale in SQLite-DB schreiben
+                        write_sale_to_db(
+                            ts=now.isoformat(),
+                            slot=current_sale_slot,
+                            price_cent=price,
+                            price_eur=amount_eur,
+                            payment="card" if sale_is_card else "cash",
+                            credit_before=sale_credit_before
+                        )
+                        
+                        # Reset für nächsten Verkauf
+                        sale_in_progress = False
+                        sale_price_cent = 0
+                        sale_is_card = False
+                        current_sale_slot = None
+                    else:
+                        log(f"⏭  take/enderog ohne Preis - ignoriert")
+                else:
+                    log(f"⏭  take/enderog ohne erog in 45s - ignoriert")
+
+                # Aufräumen
+                sale_in_progress = False
+                sale_price_cent = 0
+                sale_credit_before = 0
+                sale_credit_after = 0
+
+    # ── Kredit nur fürs Log und Fallback-Preis ──────────
     if cmd == "readcredit":
         new_count = parsed.get("credit_count", 0) or 0
         if new_count != last_credit_count and new_count > 0:
             last_credit_count = new_count
             log(f"💰  Kredit geladen: {parsed.get('credit_units', 0)} Cent (Verkäufe: {last_credit_count})")
-
-
-def _get_sale_price(state):
-    """Preis ermitteln in dieser Reihenfolge:
-    1. Slot-Preis-Tabelle
-    2. viewprice (live vom Display, für diesen oder vorherigen Slot)
-    3. Credit-Differenz (nur bei Cash, max 10€)
-    """
-    global sale_price_cent, sale_is_card, current_sale_slot
-    global sale_credit_before, sale_credit_during_erog
-
-    # 1. Wahl: Slot-Preis-Tabelle
-    slot_idx = str(current_sale_slot) if current_sale_slot else None
-    prices = state.get("prices", {})
-    if slot_idx and slot_idx in prices:
-        p_entry = prices[slot_idx]
-        try:
-            if isinstance(p_entry, dict) and "price_cent" in p_entry:
-                price = int(p_entry["price_cent"])
-            elif isinstance(p_entry, (int, float)):
-                price = int(p_entry)
-            else:
-                price = None
-            if price and price > 0:
-                log(f"   📋 Preis aus Slot-Tabelle: {price} Cent")
-                return price
-        except (ValueError, TypeError):
-            pass
-
-    # 2. Wahl: viewprice
-    if sale_price_cent and sale_price_cent > 0:
-        log(f"   🖥  Preis aus Display (viewprice): {sale_price_cent} Cent")
-        return sale_price_cent
-
-    # 3. Wahl: Credit-Differenz (nur wenn < 1000 = max 10€)
-    diff = sale_credit_before - sale_credit_during_erog
-    if diff == 0 and sale_credit_during_erog > 0:
-        diff = sale_credit_during_erog
-    if 1 <= diff < 1000:
-        log(f"   💲 Preis aus Credit-Differenz: {diff} Cent "
-            f"({sale_credit_before} - {sale_credit_during_erog})")
-        return diff
-
-    # Karte mit Credit 4900: Differenz ist immer 4900 → zu hoch
-    # Aber wenn während erog ein positiver Wert < 1000 gesehen wurde:
-    if sale_is_card and sale_credit_during_erog > 0 and sale_credit_during_erog < 1000:
-        diff = sale_credit_before - sale_credit_during_erog
-        if 1 <= diff < 1000:
-            log(f"   💲 Karten-Preis aus Credit-Diff: {diff} Cent")
-            return diff
-
-    return None
-
-
-def _finalize_sale(state, price, now):
-    """Verkauf abschließen: Telegram + Sales-Log + Reset"""
-    global sale_in_progress, sale_price_cent, sale_is_card
-    global current_sale_slot, sale_credit_before, sale_credit_during_erog
-
-    amount_eur = price / 100.0
-    slot_str = f"Slot {current_sale_slot}" if current_sale_slot else "unbekannt"
-
-    temps = state.get("temperatures", {})
-    z1 = temps.get("zone1", "?")
-    z2 = temps.get("zone2", "?")
-
-    payment_icon = "💳" if sale_is_card else "💵"
-    payment_text = "Karte" if sale_is_card else "Cash"
-
-    # Produktname aus Katalog
-    product_name = None
-    if current_sale_slot:
-        cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
-        if cat_entry:
-            product_name = cat_entry.get("name")
-
-    msg = (
-        f"🛒 <b>Verkauf ({now.strftime('%H:%M')} Uhr)</b>\n"
-        f"💰 {amount_eur:.2f}€ {payment_icon}\n"
-        f"📍 {slot_str}"
-    )
-    if product_name:
-        msg += f" — {product_name}\n"
-    else:
-        msg += "\n"
-    msg += f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
-
-    telegram_send(msg)
-    log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str} ({product_name or 'unbekannt'})")
-
-    state["last_seen"] = now.isoformat()
-    sale_data = {
-        "slot": current_sale_slot,
-        "price_cent": price,
-        "price_eur": amount_eur,
-        "payment_method": payment_text.lower(),
-        "credit_before": sale_credit_before
-    }
-    save_event(state, event_type="sale", event_data=sale_data)
-    
-    # Auch sales.jsonl schreiben (separates Format)
-    try:
-        with open(SALES_FILE, "a") as sf:
-            sf.write(json.dumps({
-                "timestamp": now.isoformat(),
-                "slot": current_sale_slot,
-                "product": product_name,
-                "amount_eur": amount_eur,
-                "payment": payment_text.lower()
-            }, ensure_ascii=False) + "\n")
-    except Exception as e:
-        log(f"⚠️  Fehler beim sales.jsonl-Schreiben: {e}")
-
-    _reset_sale()
-
-
-def _reset_sale():
-    """Sale-State zurücksetzen"""
-    global sale_in_progress, sale_price_cent, sale_is_card
-    global sale_credit_during_erog, current_sale_slot, sale_credit_before
-    sale_in_progress = False
-    sale_price_cent = 0
-    sale_is_card = False
-    sale_credit_during_erog = 0
-    current_sale_slot = None
-    sale_credit_before = 0
 
     # Temperatur-Logging alle 11 Sekunden unterdrücken wir
     # indem wir nur relevante States loggen
@@ -756,14 +694,19 @@ def listen_forever():
     # Wichtig: NACH rotate, damit wir die Preise aus dem aktuellen Log laden
     state["prices"] = load_prices_from_log()
     
-    # Produkt-Katalog laden
+    # Produkt-Katalog laden (globaler Cache für DB-Writes)
+    global _CATALOG_CACHE
     state["catalog"] = {}
     try:
         with open(CATALOG_FILE) as f:
             state["catalog"] = json.load(f)
+            _CATALOG_CACHE = state["catalog"]
         log(f"📦 Produkt-Katalog geladen: {len(state['catalog'])} Einträge")
     except (FileNotFoundError, json.JSONDecodeError):
         log("⚠️  Kein Produkt-Katalog (product_catalog.json) – Verkäufe ohne Produktnamen")
+
+    # SQLite-DB initialisieren (Tabelle anlegen falls nicht vorhanden)
+    _ensure_sales_table()
 
     while True:
         # ── Verbinden ───────────────────────────────────────
@@ -827,16 +770,10 @@ def listen_forever():
             except socket.timeout:
                 # Normal: kein Data in diesem 1s-Fenster
                 idle_cycles += 1
-                # Automat sendet ca. alle 10s Temperatur-Daten.
-                # Wenn selbst 60s nix kommt, ist der Socket tot.
                 # Alle 60 Zyklen (~60s) einen Heartbeat-Log
+                # (damit wir sehen dass die Verbindung noch lebt)
                 if idle_cycles % 60 == 0:
                     log(f"💓 Heartbeat (verbunden seit id={idle_cycles//60} min)")
-                # Verbindung neu aufbauen wenn 60s keine Daten kamen
-                # (Socket kann "stumm sterben" ohne FIN/RST)
-                if idle_cycles >= 60:
-                    log(f"⏰ Keine Daten seit 60s - erzwinge Reconnect")
-                    break
                 continue
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 log(f"⚠️ Verbindungsfehler: {e}")
@@ -855,11 +792,11 @@ def listen_forever():
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    log("🚀 FAS 1050 PRO Live-Listener gestartet")
+    log("🚀 VaS 1050 Live-Listener gestartet")
     log(f"📁 Automat: {HOST}:{PORT}")
     log(f"📁 State:   {STATE_FILE}")
     log(f"📝 Raw:     {RAW_FILE}")
-    log(f"📊 Events:  {EVENTS_FILE}")
+    log(f"💾 DB:      {DB_FILE}")
     log("=" * 50)
     log("📡 Warte auf Daten vom Automaten...")
     listen_forever()
