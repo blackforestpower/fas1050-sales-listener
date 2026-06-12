@@ -1,17 +1,16 @@
 [Unit]
-[Unit]
 Description=FAS 1050 PRO Vending Machine Listener
-Documentation=https://github.com/openclaw/openclaw (Projekt camiro-automat-fas1050)
+Documentation=https://github.com/blackforestpower/fas1050-sales-listener
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/root/.openclaw/workspace/camiro-automat-fas1050/fas1050_listener.py
+ExecStart=/root/.openclaw/workspace/fas1050-sales-listener/fas1050_listener_v5.py
 Restart=always
 RestartSec=10
 User=root
-WorkingDirectory=/root/.openclaw/workspace
+WorkingDirectory=/root/.openclaw/workspace/fas1050-sales-listener
 
 [Install]
 WantedBy=multi-user.target
