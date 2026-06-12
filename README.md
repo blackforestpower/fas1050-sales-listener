@@ -1,4 +1,4 @@
-# FAS 1050 PRO Vending Machine — Sales Listener
+# FAS 1050 PRO Vending Machine — Sales Listener (v5)
 
 Passiver Lauscher für den FAS 1050 PRO Vending-Automaten.
 **LiSPI (Listen Only, No Transmit)** — es werden KEINE Kommandos gesendet.
@@ -9,6 +9,26 @@ Der Automat sendet auf TCP-Port 8888 kontinuierlich Statusdaten im Klartext (ASC
 Der Listener verbindet sich einmalig und lauscht — der Automat pusht, der Client empfängt nur.
 
 Es gibt **kein Login, kein Handshake, kein Polling**.
+
+## Quickstart
+
+```bash
+# 1. Konfiguration anlegen (IP & Token eintragen!)
+cp .env.example .env
+nano .env
+
+# 2. Service installieren & starten
+sudo cp fas1050-listener.service /etc/systemd/system/vas1050-listener.service
+sudo systemctl daemon-reload
+sudo systemctl enable vas1050-listener
+sudo systemctl start vas1050-listener
+
+# 3. Logs prüfen
+sudo journalctl -u vas1050-listener -f
+```
+
+> ⚠️ **Hinweis:** `VAS1050_HOST` ist **zwingend erforderlich** — ohne `.env` startet das Skript nicht!
+  `.env` wird nicht versioniert (in `.gitignore`).
 
 ## Datenformat (ASCII, Zeilen mit `\r\n`)
 
@@ -22,7 +42,7 @@ Es gibt **kein Login, kein Handshake, kein Polling**.
 | `readcredit: ack <einheiten> <anzahl>` | `0 5` → Guthaben / Zähler | Kredit/Verkaufszähler |
 | `readclock: ack <tag> <mon> <jahr> <wtag> <std> <min> <sec>` | `7 6 25 7 14 15 58` → 07.06.2025 14:15:58 | Automaten-Uhr |
 
-## Verkaufserkennung (v4)
+## Verkaufserkennung (v5)
 
 Es gibt **zwei völlig unterschiedliche Zahlungsprozesse**, die unterschiedlich erkannt werden:
 
@@ -92,40 +112,55 @@ Alle Daten liegen im Ordner `data/`:
 | Datei | Beschreibung |
 |-------|-------------|
 | `current_state.json` | Aktueller Zustand (wird ständig überschrieben) |
-| `events.jsonl` | Relevante Ereignisse (Verkäufe, Zustandswechsel, Fehler) — eine JSON-Zeile pro Event. Enthält auch `payment_method`, `credit_before` |
+| `sales.db` | SQLite-Datenbank mit allen Verkäufen (inkl. Produktname, Zahlungsart, Temperatur) |
 | `raw_stream.log` | **Jede** Zeile vom Automaten mit Zeitstempel — rotiert bei >5MB oder >24h |
 | `product_catalog.json` | Produktnamen pro Slot (optional, für schönere Telegram-Nachrichten) |
 
-## Installation
-
-```bash
-# Service-Datei installieren
-sudo cp fas1050-listener.service /etc/systemd/system/
-
-# Service aktivieren und starten
-sudo systemctl daemon-reload
-sudo systemctl enable fas1050-listener.service
-sudo systemctl start fas1050-listener.service
-
-# Status prüfen
-sudo systemctl status fas1050-listener.service
-
-# Logs live ansehen
-sudo journalctl -u fas1050-listener.service -f
-```
-
 ## Konfiguration
 
-Alle Einstellungen erfolgen via **`.env` Datei** (siehe `.env.example` für alle verfügbaren Optionen).
+Alle Einstellungen erfolgen ausschließlich via **`.env` Datei** (siehe `.env.example`).
 
-➡️ `.env` liegt im Projektordner, ist in `.gitignore` und wird **nicht versioniert**. Das Skript lädt sie automatisch via `python-dotenv`.
+➡️ `.env` liegt im Projektordner, ist in `.gitignore` und wird **nicht versioniert**. Das Skript lädt sie via `python-dotenv` und **bricht ab**, wenn `VAS1050_HOST` fehlt.
+
+| Variable | Pflicht | Default | Beschreibung |
+|----------|---------|---------|-------------|
+| `VAS1050_HOST` | ✅ Ja | — | IP-Adresse des Automaten |
+| `VAS1050_PORT` | ❌ Nein | `8888` | TCP-Port |
+| `VAS1050_RECONNECT_DELAY` | ❌ Nein | `5` | Sekunden bis Wiederverbindung |
+| `VAS1050_TELEGRAM_BOT_TOKEN` | ❌ Nein | — | Bot-Token (für Telegram-Benachrichtigungen) |
+| `VAS1050_TELEGRAM_CHAT_ID` | ❌ Nein | — | Ziel-Chat-ID |
 
 ```bash
 cp .env.example .env
-# Dann .env editieren und echte Werte eintragen:
-#   VAS1050_HOST=x.x.x.x
-#   VAS1050_TELEGRAM_BOT_TOKEN=dein_bot_token
-#   VAS1050_TELEGRAM_CHAT_ID=deine_chat_id
+nano .env
+```
+
+## Manueller Test
+
+```bash
+python3 fas1050_listener_v5.py
+# Oder: Rohdaten live verfolgen
+tail -f data/raw_stream.log
+```
+
+## Installation (systemd)
+
+```bash
+# Service-Datei installieren
+sudo cp fas1050-listener.service /etc/systemd/system/vas1050-listener.service
+
+# Ausführbar machen (falls nicht schon)
+chmod +x fas1050_listener_v5.py
+
+# Service aktivieren und starten
+sudo systemctl daemon-reload
+sudo systemctl enable --now vas1050-listener
+
+# Status prüfen
+sudo systemctl status vas1050-listener
+
+# Logs live ansehen
+sudo journalctl -u vas1050-listener -f
 ```
 
 ## Manueller Test
@@ -141,13 +176,31 @@ tail -f data/raw_stream.log
 | Eigenschaft | Wert |
 |-------------|------|
 | Automat | FAS 1050 PRO |
-| IP | X.X.X.X |
+| IP | via `VAS1050_HOST` in `.env` |
 | Port | TCP 8888 (Management-Interface) |
-| Port 8889 | Seriennummer |
+| Port 8889 | Seriennummer (nicht genutzt) |
 | Authentifizierung | Keine |
-| Protokoll | Reines ASCII, zeilenbasiert |
+| Protokoll | Reines ASCII, zeilenbasiert über TCP |
+| Max. Clients | 2 gleichzeitig |
 
-> ⚠️ **Hinweis zur Erreichbarkeit:** Der Automat ist **nur im lokalen Netzwerk (LAN/WLAN)** erreichbar. Die IP wird in der `.env` Datei als `VAS1050_HOST` konfiguriert.
+> ⚠️ **Hinweis zur Erreichbarkeit:** Der Automat ist **nur im lokalen Netzwerk (LAN/WLAN)** erreichbar.
+
+## SQLite-Datenbank (`data/sales.db`)
+
+```sql
+CREATE TABLE IF NOT EXISTS sales (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT NOT NULL,
+    slot            TEXT,
+    product         TEXT,
+    category        TEXT,
+    price_cent      INTEGER NOT NULL,
+    price_eur       REAL NOT NULL,
+    payment         TEXT NOT NULL,    -- "card" oder "cash"
+    credit_before   INTEGER,
+    source          TEXT DEFAULT 'listener'
+);
+```
 
 ## Lizenz
 
