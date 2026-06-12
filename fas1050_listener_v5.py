@@ -70,7 +70,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 # ─── KONFIGURATION ────────────────────────────────────────────
-HOST = "192.168.200.56"          # IP des VaS 1050 Automaten (Lingen)
+HOST = "192.168.200.146"         # IP des VaS 1050 Automaten
 PORT = 8888                       # TCP-Port (Management-Interface)
 RECONNECT_DELAY = 5               # Sekunden bis zum Wiederverbinden
 
