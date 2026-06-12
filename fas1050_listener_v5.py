@@ -68,11 +68,28 @@ import sqlite3
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+from dotenv import load_dotenv
+
+# ─── .env laden ───────────────────────────────────────────────
+load_dotenv()
 
 # ─── KONFIGURATION ────────────────────────────────────────────
-HOST = "192.168.200.146"         # IP des VaS 1050 Automaten
-PORT = 8888                       # TCP-Port (Management-Interface)
-RECONNECT_DELAY = 5               # Sekunden bis zum Wiederverbinden
+HOST = os.environ.get("VAS1050_HOST")
+if not HOST:
+    print("❌ VAS1050_HOST nicht gesetzt — .env prüfen!")
+    sys.exit(1)
+
+try:
+    PORT = int(os.environ.get("VAS1050_PORT", "8888"))
+except ValueError:
+    print("❌ VAS1050_PORT ungültig — muss eine Zahl sein")
+    sys.exit(1)
+
+try:
+    RECONNECT_DELAY = int(os.environ.get("VAS1050_RECONNECT_DELAY", "5"))
+except ValueError:
+    print("❌ VAS1050_RECONNECT_DELAY ungültig — muss eine Zahl sein")
+    sys.exit(1)
 
 # ─── TELEGRAM ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
