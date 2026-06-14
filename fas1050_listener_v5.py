@@ -306,14 +306,12 @@ def parse_line(line):
         # ── Verkaufsstatus ─────────────────────────────────
         elif "selstate" in cmd:
             result["state"] = values[0] if values else "unknown"
-            # viewprice kann "viewprice 250" enthalten → Preis extrahieren
-            if "viewprice" in result["state"]:
-                parts = result["state"].split()
-                if len(parts) >= 2:
-                    try:
-                        result["viewprice_cent"] = int(parts[1])
-                    except ValueError:
-                        pass
+            # viewprice: Preis steht in values[1] (z.B. "viewprice 250")
+            if "viewprice" in result["state"] and len(values) >= 2:
+                try:
+                    result["viewprice_cent"] = int(values[1])
+                except ValueError:
+                    pass
 
         # ── Guthaben / Verkaufszähler ──────────────────────
         elif "readcredit" in cmd and len(values) >= 2:
@@ -488,9 +486,10 @@ sale_price_cent = 0       # Preis aus viewprice
 current_sale_slot = None
 last_erog_time = 0        # epoch seconds
 
-# Für Preisermittlung bei erog / take
+# Für die Verkaufserkennung
 sale_credit_before = 0    # Kredit-Wert bei erog
 sale_is_card = False      # Wurde 4900 (Karte) gesehen?
+sale_credit_price = None  # Preis aus erstem Kredit-Drop während erog (Cash)
 
 
 def telegram_send(text):
@@ -511,17 +510,75 @@ def telegram_send(text):
         log(f"⚠️  Telegram-Fehler: {e}")
 
 
+def _finalize_sale(state, now, current_sale_slot, price, payment_type, credit_before):
+    """
+    Führt einen Verkauf final aus: Telegram + DB-Write.
+    
+    Args:
+        state: Aktueller Automaten-Status (für Katalog + Temperaturen)
+        now: datetime-Objekt
+        current_sale_slot: Slot-Nummer als String (z.B. "52", "167")
+        price: Preis in Cent
+        payment_type: "card" oder "cash"
+        credit_before: Kredit vor dem Verkauf
+    """
+    slot_str = f"Slot {current_sale_slot}" if current_sale_slot else "unbekannt"
+    amount_eur = price / 100.0
+    
+    temps = state.get("temperatures", {})
+    z1 = temps.get("zone1", "?")
+    z2 = temps.get("zone2", "?")
+    
+    pay_icon = "💳 Karte" if payment_type == "card" else "💵 Cash"
+    
+    product_name = None
+    if current_sale_slot:
+        cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
+        if cat_entry:
+            product_name = cat_entry.get("name")
+    
+    msg = (
+        f"🛒 <b>Verkauf am Automaten! ({now.strftime('%H:%M')} Uhr)</b>\n"
+        f"💰 {amount_eur:.2f}€ {pay_icon}\n"
+        f"📍 {slot_str}"
+    )
+    if product_name:
+        msg += f" — {product_name}\n"
+    else:
+        msg += "\n"
+    msg += f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
+    telegram_send(msg)
+    log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str}")
+    
+    write_sale_to_db(
+        ts=now.isoformat(),
+        slot=current_sale_slot,
+        price_cent=price,
+        price_eur=amount_eur,
+        payment=payment_type,
+        credit_before=credit_before
+    )
+
+
 def detect_sale(line, parsed, state):
     """
     Erkennt VERKÄUFE anhand der Protokoll-Sequenz.
     
-    Zwei Prozesse:
-    💳 KARTE (credit_before = 4900) → Preis aus Slot-Tabelle
-    💵 CASH (credit_before < 4900) → Preis aus viewprice
+    STRUKTURELLE TRENNUNG:
+    💳 KARTE (credit_before == 4900):
+       - Signal: Kredit 4900 (Kartenterminal-Reserve)
+       - Preis:  Slot-Preis-Tabelle (prices["<rack*100+slot>"])
+       - Abschluss: enderog (KEIN take-Status bei Karte!)
+       - Alter:   `select 1 <slot>` = Altersprüfung via Karte
+    
+    💵 CASH (credit_before < 4900):
+       - Signal: Kredit < 4900 (eingeworfener Betrag)
+       - Preis:  viewprice (Display-Anzeige, exakt)
+       - Abschluss: take (Ware wird entnommen)
     """
     global last_credit_count, sale_in_progress, sale_price_cent
     global current_sale_slot, last_erog_time
-    global sale_credit_before, sale_is_card
+    global sale_credit_before, sale_is_card, sale_credit_price
 
     now = datetime.now()
 
@@ -548,11 +605,19 @@ def detect_sale(line, parsed, state):
                 sale_price_cent = vp
 
     # ── readcredit 4900 = Karte erkannt ───────────────
+    #    Bei Cash: ersten Kredit-Drop als Preis merken
     if "readcredit" in cmd:
         cu = parsed.get("credit_units", 0)
         if cu == 4900 and not sale_in_progress:
             sale_is_card = True
             log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
+        if sale_in_progress and not sale_is_card:
+            # Cash: ersten Kredit-Drop tracken (sale_credit_before → X = Preis)
+            if sale_credit_price is None and cu < sale_credit_before and cu >= 0:
+                diff = sale_credit_before - cu
+                if 1 <= diff <= 10000:
+                    sale_credit_price = diff
+                    log(f"   💵 Kredit-Drop: {sale_credit_before}→{cu} = {diff} Cent")
 
     # ── selstate Continue für erog/take ─────────────────
     if "selstate" in cmd:
@@ -575,11 +640,14 @@ def detect_sale(line, parsed, state):
                         f"credit_before={sale_credit_before} | "
                         f"{'💳 Karte' if sale_is_card else '💵 Cash'}")
 
-        # 🔚 Verkauf abgeschlossen: take unlock
-        if new_state.startswith("take"):
+        # ── 💳💵 SALE ABSCHLIESSEN (enderog) ─────────────
+        # BEIDE Zahlungsarten schliessen bei enderog ab:
+        #   💳 Karte:  credit_before=4900 → Preis aus Slot-Tabelle
+        #   💵 Cash:   credit_before<4900 → Preis aus Kredit-Differenz
+        # Ausnahme: manche Slots haben take vor enderog (z.B. Slot 52 ohne Altersprüfung)
+        if new_state.startswith("enderog"):
             if sale_in_progress:
                 if time.time() - last_erog_time < 45:
-                    # PREIS ERMITTELN
                     price = None
                     
                     if sale_is_card:
@@ -593,92 +661,78 @@ def detect_sale(line, parsed, state):
                             elif isinstance(p_entry, (int, float)):
                                 price = int(p_entry)
                         if price:
-                            log(f"   💳 Preis aus Slot-Tabelle: {price} Cent")
+                            log(f"   💳 Kartenzahlung {price} Cent (Slot {slot_idx})")
+                            _finalize_sale(state, now, current_sale_slot, price, "card", sale_credit_before)
                         else:
                             log(f"   ⚠️  Karte aber kein Slot-Preis für {slot_idx}")
+                            log(f"⏭  Kartenzahlung ohne Preis - ignoriert")
                     else:
-                        # 💵 CASH: Preis aus viewprice
-                        price = sale_price_cent if sale_price_cent > 0 else None
-                        
-                        # Fallback: Kredit-Differenz (wenn viewprice mal fehlt)
-                        if not price:
-                            credit = state.get("credit", {})
-                            sale_credit_after = credit.get("units", 0) or 0
-                            diff = sale_credit_before - sale_credit_after
-                            # Bei Cash: z.B. 500 - 250 = 250 (Rückgeld 250, Preis 250)
-                            # oder: 250 - 0 = 250 (exakt bezahlt)
-                            if 1 <= diff <= 10000:
-                                # ABER: bei 5€-Schein + 2.50€ Rückgeld ist diff = 500-250=250
-                                # bei exakter Zahlung: diff = 250-0=250
-                                # Beide Fälle: diff = 250 = korrekt!
-                                # Rückgeld-Fall: credit_after=250, diff=250 (nicht der Preis!)
-                                # Lösung: bei Cash ist der Kredit-Verlauf: 
-                                # vorher 500, nach take 0 oder whatever
-                                # Der PREIS ist: Kredit_davor - Kredit_waehrend_erog
-                                # ODER einfacher: viewprice!
-                                log(f"   ⚠️  Cash-Fallback: Kredit-Diff {diff} (bp={sale_credit_before}→{sale_credit_after})")
-                                price = diff
-                        
-                        if price:
-                            log(f"   💵 Preis: {price} Cent (viewprice={sale_price_cent})")
-
-                    if price and price > 0:
-                        slot_str = f"Slot {current_sale_slot}" if current_sale_slot else "unbekannt"
-                        amount_eur = price / 100.0
-
-                        temps = state.get("temperatures", {})
-                        z1 = temps.get("zone1", "?")
-                        z2 = temps.get("zone2", "?")
-
-                        payment_method = "💳 Karte" if sale_is_card else "💵 Cash"
-
-                        # Produktname aus Katalog (falls vorhanden)
-                        product_name = None
-                        if current_sale_slot:
-                            cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
-                            if cat_entry:
-                                product_name = cat_entry.get("name")
-
-                        msg = (
-                            f"🛒 <b>Verkauf am Automaten! ({now.strftime('%H:%M')} Uhr)</b>\n"
-                            f"💰 {amount_eur:.2f}€ {payment_method}\n"
-                            f"📍 {slot_str}"
-                        )
-                        if product_name:
-                            msg += f" — {product_name}\n"
+                        # 💵 CASH: Preis aus Kredit-Drop (während erog getrackt)
+                        if sale_credit_price and 1 <= sale_credit_price <= 10000:
+                            price = sale_credit_price
+                            log(f"   💵 Barzahlung {price} Cent (Kredit-Drop)")
+                            _finalize_sale(state, now, current_sale_slot, price, "cash", sale_credit_before)
                         else:
-                            msg += "\n"
-                        msg += (
-                            f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
-                        )
-                        telegram_send(msg)
-                        log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str}")
-                        
-                        # Sale in SQLite-DB schreiben
-                        write_sale_to_db(
-                            ts=now.isoformat(),
-                            slot=current_sale_slot,
-                            price_cent=price,
-                            price_eur=amount_eur,
-                            payment="card" if sale_is_card else "cash",
-                            credit_before=sale_credit_before
-                        )
-                        
-                        # Reset für nächsten Verkauf
-                        sale_in_progress = False
-                        sale_price_cent = 0
-                        sale_is_card = False
-                        current_sale_slot = None
-                    else:
-                        log(f"⏭  take/enderog ohne Preis - ignoriert")
+                            log(f"   ⚠️  Kein Kredit-Drop erfasst (bp={sale_credit_before})")
+                            log(f"⏭  Barzahlung ohne Preis - ignoriert")
                 else:
-                    log(f"⏭  take/enderog ohne erog in 45s - ignoriert")
-
-                # Aufräumen
+                    log(f"⏭  enderog ohne erog in 45s - ignoriert")
+                
+                # IMMER aufräumen – sonst klemmt sale_in_progress
                 sale_in_progress = False
                 sale_price_cent = 0
                 sale_credit_before = 0
-                sale_credit_after = 0
+                sale_is_card = False
+                sale_credit_price = None
+                current_sale_slot = None
+
+        # ── FALLBACK: Sale abschliessen bei take ───────────
+        # (nur für Slots OHNE Altersprüfung, die take vor enderog haben)
+        if new_state.startswith("take"):
+            if sale_in_progress:
+                if time.time() - last_erog_time < 45:
+                    price = None
+                    
+                    if sale_is_card:
+                        slot_idx = str(current_sale_slot) if current_sale_slot else None
+                        prices = state.get("prices", {})
+                        if slot_idx and slot_idx in prices:
+                            p_entry = prices[slot_idx]
+                            if isinstance(p_entry, dict) and "price_cent" in p_entry:
+                                price = p_entry["price_cent"]
+                            elif isinstance(p_entry, (int, float)):
+                                price = int(p_entry)
+                        if price:
+                            log(f"   💳 Kartenzahlung {price} Cent (Slot {slot_idx}, take)")
+                            _finalize_sale(state, now, current_sale_slot, price, "card", sale_credit_before)
+                        else:
+                            log(f"   ⚠️  Karte kein Slot-Preis für {slot_idx} (take)")
+                    else:
+                        # 💵 CASH: Preis aus Kredit-Drop (während erog getrackt)
+                        if sale_credit_price and 1 <= sale_credit_price <= 10000:
+                            price = sale_credit_price
+                            log(f"   💵 Barzahlung {price} Cent (Kredit-Drop, take)")
+                        else:
+                            # Fallback: Kredit-Differenz bei enderog
+                            credit = state.get("credit", {})
+                            sale_credit_after = credit.get("units", 0) or 0
+                            diff = sale_credit_before - sale_credit_after
+                            if 1 <= diff <= 10000:
+                                price = diff
+                                log(f"   ⚠️  Cash-Fallback: Kredit-Diff {diff} (take)")
+                        if price:
+                            _finalize_sale(state, now, current_sale_slot, price, "cash", sale_credit_before)
+                        else:
+                            log(f"⏭  Barzahlung ohne Preis - ignoriert (take)")
+                else:
+                    log(f"⏭  take ohne erog in 45s - ignoriert")
+                
+                sale_in_progress = False
+                sale_price_cent = 0
+                sale_credit_before = 0
+                sale_is_card = False
+                sale_credit_price = None
+                current_sale_slot = None
 
     # ── Kredit nur fürs Log und Fallback-Preis ──────────
     if cmd == "readcredit":
@@ -787,10 +841,18 @@ def listen_forever():
             except socket.timeout:
                 # Normal: kein Data in diesem 1s-Fenster
                 idle_cycles += 1
-                # Alle 60 Zyklen (~60s) einen Heartbeat-Log
+                # Alle 600 Zyklen (~10 min) einen Heartbeat-Log
                 # (damit wir sehen dass die Verbindung noch lebt)
-                if idle_cycles % 60 == 0:
-                    log(f"💓 Heartbeat (verbunden seit id={idle_cycles//60} min)")
+                if idle_cycles % 600 == 0:
+                    idle_mins = idle_cycles // 60
+                    log(f"💓 Heartbeat ({idle_mins} min ohne Daten)")
+                # Watchdog: nach 5 Minuten ohne Daten → Reconnect
+                # (verhindert Zombie-Verbindungen, wenn der Automat neustartet
+                #  oder die Leitung tot ist, der Socket aber offen bleibt)
+                if idle_cycles >= 300:  # 300 * 1s = 5 Minuten
+                    idle_mins = idle_cycles // 60
+                    log(f"🔄 Watchdog: {idle_mins} min ohne Daten – Reconnect")
+                    break
                 continue
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 log(f"⚠️ Verbindungsfehler: {e}")
