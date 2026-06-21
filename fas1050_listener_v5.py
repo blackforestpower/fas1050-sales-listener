@@ -118,6 +118,34 @@ CATALOG_FILE = os.path.join(DATA_DIR, "product_catalog.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
+LOCK_FILE = os.path.join(DATA_DIR, "listener.lock")
+
+
+def check_lock():
+    """PID-Lockfile: verhindert doppelten Listener-Start."""
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE) as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)
+            log(f"⚠️  Listener läuft bereits (PID {old_pid}) – beende mich")
+            sys.exit(0)
+        except (OSError, ProcessLookupError):
+            log(f"🗑  Altes Lockfile (PID {old_pid}) – Prozess tot, überschreibe")
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    log(f"🔒 Lockfile {LOCK_FILE} (PID {os.getpid()})")
+
+
+def cleanup_lock():
+    """Lockfile beim Beenden aufräumen."""
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE) as f:
+            pid_in_file = int(f.read().strip())
+        if pid_in_file == os.getpid():
+            os.remove(LOCK_FILE)
+            log("🔓 Lockfile entfernt")
+
 
 def rotate_log_if_needed():
     """raw_stream.log rotieren wenn >24h alt oder >5MB"""
@@ -141,44 +169,7 @@ def rotate_log_if_needed():
         pass  # Neu, kein rotate nötig
 
 
-def load_prices_from_log():
-    """Beim Start: Preise aus raw_stream.log laden (letzten kompletten readprice-Burst)"""
-    prices = {}
-    try:
-        with open(RAW_FILE) as f:
-            for line in f:
-                if "readprice" not in line or ": ack" not in line:
-                    continue
-                # "readprice 0 11: ack 1 500 210 210"
-                idx = line.index("readprice")
-                line = line[idx:]
-                idx2 = line.index(": ack")
-                cmd_part = line[:idx2]
-                rest = line[idx2 + 5:].strip()
-                parts = cmd_part.split()
-                if len(parts) >= 3:
-                    try:
-                        rack = int(parts[1])
-                        slot = int(parts[2])
-                    except ValueError:
-                        continue
-                val_parts = rest.split()
-                if len(val_parts) >= 2:
-                    try:
-                        slot_id = int(val_parts[0])
-                        price_cent = int(val_parts[1])
-                    except ValueError:
-                        continue
-                    slot_num = str(rack * 100 + slot)
-                    prices[slot_num] = {
-                        "slot_id": slot_id,
-                        "price_cent": price_cent,
-                        "price_eur": price_cent / 100.0
-                    }
-    except FileNotFoundError:
-        pass
-    log(f"🏷  Geladene Preise aus Log: {len(prices)} Slots")
-    return prices
+# load_prices_from_log() entfernt – Preise werden jetzt aus current_state.json geladen
 
 
 # ─── SQLite Sales-DB ──────────────────────────────────────────
@@ -452,8 +443,10 @@ def process_line(line, state, last_state):
 
 def save_state(state):
     """Aktuellen Zustand als JSON speichern (immer überschreiben)"""
+    # catalog aus state rausfiltern – kommt immer frisch aus product_catalog.json
+    save = {k: v for k, v in state.items() if k != "catalog"}
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+        json.dump(save, f, indent=2, ensure_ascii=False)
 
 # ═══════════════════════════════════════════════════════════════
 #  SALES DETECTION + TELEGRAM
@@ -464,11 +457,10 @@ def save_state(state):
 # Es gibt zwei völlig unterschiedliche Zahlungsprozesse:
 #
 # 💳 KARTE (Kredit = 4900 = 49,00€ Reserve)
-#   select → (viewprice optional) → readcredit 4900 → select → erog → readcredit 0 → take
+#   select → viewprice → readcredit 4900 → select → erog → readcredit 0 → take
 #   - 4900 = Kartenterminal-Reserve, NICHT der Preis!
-#   - Preis kommt aus Slot-Preis-Tabelle
-#   - viewprice kann erscheinen (Display), wird aber nicht für Preis genutzt
-#   - Direkt von 4900 auf 0, kein Kredit-Verlauf
+#   - Preis: PRIO 1 viewprice (kommt immer) → PRIO 2 Preiscache → PRIO 3 Kredit-Drop (wenn != 4900)
+#   - viewprice wird NICHT mehr von select resettet → bleibt erhalten
 #
 # 💵 CASH (Kredit = eingeworfener Geldbetrag)
 #   select → viewprice → readcredit X (mehrere, steigend) → select → erog
@@ -567,13 +559,13 @@ def detect_sale(line, parsed, state):
     STRUKTURELLE TRENNUNG:
     💳 KARTE (credit_before == 4900):
        - Signal: Kredit 4900 (Kartenterminal-Reserve)
-       - Preis:  Slot-Preis-Tabelle (prices["<rack*100+slot>"])
-       - Abschluss: enderog (KEIN take-Status bei Karte!)
+       - Preis:  PRIO 1 viewprice → PRIO 2 Preiscache → PRIO 3 Kredit-Drop (wenn != 4900)
+       - Abschluss: take (bei Card mit take) oder enderog
        - Alter:   `select 1 <slot>` = Altersprüfung via Karte
     
     💵 CASH (credit_before < 4900):
        - Signal: Kredit < 4900 (eingeworfener Betrag)
-       - Preis:  viewprice (Display-Anzeige, exakt)
+       - Preis:  Kredit-Drop (Differenz während erog)
        - Abschluss: take (Ware wird entnommen)
     """
     global last_credit_count, sale_in_progress, sale_price_cent
@@ -591,10 +583,9 @@ def detect_sale(line, parsed, state):
             rack = int(parts[1])
             slot_num = int(parts[2])
             current_sale_slot = str(rack * 100 + slot_num)
-            # viewprice zurücksetzen (neue Auswahl)
-            sale_price_cent = 0
+            # viewprice NICHT zurücksetzen – kann vor select kommen
 
-    # ── viewprice: Preis merken (NUR bei Cash relevant) ──
+    # ── viewprice: Preis merken (für Cash & Karte) ──
     if "selstate" in cmd:
         new_state = parsed.get("state", "")
 
@@ -611,13 +602,14 @@ def detect_sale(line, parsed, state):
         if cu == 4900 and not sale_in_progress:
             sale_is_card = True
             log(f"   💳 Kartenzahlung erkannt (Kredit 4900)")
-        if sale_in_progress and not sale_is_card:
-            # Cash: ersten Kredit-Drop tracken (sale_credit_before → X = Preis)
+        # Bei laufendem Verkauf: Kredit-Drop tracken (für Cash & Karte)
+        if sale_in_progress:
             if sale_credit_price is None and cu < sale_credit_before and cu >= 0:
                 diff = sale_credit_before - cu
                 if 1 <= diff <= 10000:
                     sale_credit_price = diff
-                    log(f"   💵 Kredit-Drop: {sale_credit_before}→{cu} = {diff} Cent")
+                    icon = "💳" if sale_is_card else "💵"
+                    log(f"   {icon} Kredit-Drop: {sale_credit_before}→{cu} = {diff} Cent")
 
     # ── selstate Continue für erog/take ─────────────────
     if "selstate" in cmd:
@@ -651,20 +643,36 @@ def detect_sale(line, parsed, state):
                     price = None
                     
                     if sale_is_card:
-                        # 💳 KARTE: Preis aus Slot-Tabelle
+                        # 💳 KARTE: Preis live aus Stream holen (kein Log-Burst nötig)
                         slot_idx = str(current_sale_slot) if current_sale_slot else None
-                        prices = state.get("prices", {})
-                        if slot_idx and slot_idx in prices:
-                            p_entry = prices[slot_idx]
-                            if isinstance(p_entry, dict) and "price_cent" in p_entry:
-                                price = p_entry["price_cent"]
-                            elif isinstance(p_entry, (int, float)):
-                                price = int(p_entry)
+                        price = None
+                        
+                        # PRIO 1: viewprice (wenn Slot zuerst, dann Karte)
+                        if sale_price_cent and 1 <= sale_price_cent <= 10000:
+                            price = sale_price_cent
+                            log(f"   💳 Kartenzahlung {price} Cent (viewprice, Slot {slot_idx})")
+                        
+                        # PRIO 2: Preiscache (wenn viewprice fehlt, z.B. Karte vor Slot)
+                        if price is None and slot_idx:
+                            prices = state.get("prices", {})
+                            slot_price = prices.get(slot_idx, {}).get("price_cent")
+                            if slot_price and 1 <= slot_price <= 10000:
+                                price = slot_price
+                                log(f"   💳 Kartenzahlung {price} Cent (Preiscache Slot {slot_idx})")
+                        
+                        # PRIO 3: Kredit-Differenz (wenn beides fehlschlägt)
+                        if price is None and sale_credit_price:
+                            # 4900 = volle Kartengutschrift kann nie der Preis sein
+                            if sale_is_card and sale_credit_price == 4900:
+                                log(f"   ⚠️  Kredit-Drop = 4900 (volle Reserve, kein Preis)")
+                            else:
+                                price = sale_credit_price
+                                log(f"   💳 Kartenzahlung {price} Cent (Kredit-Drop, Slot {slot_idx})")
+                        
                         if price:
-                            log(f"   💳 Kartenzahlung {price} Cent (Slot {slot_idx})")
                             _finalize_sale(state, now, current_sale_slot, price, "card", sale_credit_before)
                         else:
-                            log(f"   ⚠️  Karte aber kein Slot-Preis für {slot_idx}")
+                            log(f"   ⚠️  Karte aber kein Preis für Slot {slot_idx} (viewprice/Preiscache/Kredit-Drop alle leer)")
                             log(f"⏭  Kartenzahlung ohne Preis - ignoriert")
                     else:
                         # 💵 CASH: Preis aus Kredit-Drop (während erog getrackt)
@@ -695,18 +703,25 @@ def detect_sale(line, parsed, state):
                     
                     if sale_is_card:
                         slot_idx = str(current_sale_slot) if current_sale_slot else None
-                        prices = state.get("prices", {})
-                        if slot_idx and slot_idx in prices:
-                            p_entry = prices[slot_idx]
-                            if isinstance(p_entry, dict) and "price_cent" in p_entry:
-                                price = p_entry["price_cent"]
-                            elif isinstance(p_entry, (int, float)):
-                                price = int(p_entry)
+                        price = None
+                        
+                        # PRIO 1: viewprice
+                        if sale_price_cent and 1 <= sale_price_cent <= 10000:
+                            price = sale_price_cent
+                            log(f"   💳 Kartenzahlung {price} Cent (viewprice, {slot_idx}, take)")
+                        
+                        # PRIO 2: Kredit-Differenz
+                        if price is None and sale_credit_price:
+                            if sale_is_card and sale_credit_price == 4900:
+                                log(f"   ⚠️  Kredit-Drop = 4900 (volle Reserve, kein Preis)")
+                            else:
+                                price = sale_credit_price
+                                log(f"   💳 Kartenzahlung {price} Cent (Kredit-Drop, {slot_idx}, take)")
+                        
                         if price:
-                            log(f"   💳 Kartenzahlung {price} Cent (Slot {slot_idx}, take)")
                             _finalize_sale(state, now, current_sale_slot, price, "card", sale_credit_before)
                         else:
-                            log(f"   ⚠️  Karte kein Slot-Preis für {slot_idx} (take)")
+                            log(f"   ⚠️  Karte kein Preis für {slot_idx} (take)")
                     else:
                         # 💵 CASH: Preis aus Kredit-Drop (während erog getrackt)
                         if sale_credit_price and 1 <= sale_credit_price <= 10000:
@@ -761,9 +776,18 @@ def listen_forever():
     state = {}  # Aktueller Zustand (wächst mit jedem neuen Datentyp)
     # Log-Rotation: raw_stream.log alle 24h oder >5MB rotieren
     rotate_log_if_needed()
-    # Preise aus raw_stream.log laden (für Slot-Preis-Fallback bei Kartenzahlung)
-    # Wichtig: NACH rotate, damit wir die Preise aus dem aktuellen Log laden
-    state["prices"] = load_prices_from_log()
+    # Preise aus current_state.json laden (letzter Live-Stand)
+    # Der Live-Listener speichert readprice-Befehle dort via save_state()
+    state["prices"] = {}
+    try:
+        with open(STATE_FILE) as f:
+            saved_state = json.load(f)
+            saved_prices = saved_state.get("prices", {})
+            if saved_prices:
+                state["prices"] = saved_prices
+                log(f"🏷  Preise aus current_state geladen: {len(saved_prices)} Slots")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
     
     # Produkt-Katalog laden (globaler Cache für DB-Writes)
     global _CATALOG_CACHE
@@ -849,9 +873,9 @@ def listen_forever():
                 # Watchdog: nach 5 Minuten ohne Daten → Reconnect
                 # (verhindert Zombie-Verbindungen, wenn der Automat neustartet
                 #  oder die Leitung tot ist, der Socket aber offen bleibt)
-                if idle_cycles >= 300:  # 300 * 1s = 5 Minuten
-                    idle_mins = idle_cycles // 60
-                    log(f"🔄 Watchdog: {idle_mins} min ohne Daten – Reconnect")
+                if idle_cycles >= 12:  # 12 * 1s = 12 Sekunden
+                    idle_secs = idle_cycles
+                    log(f"🔄 Watchdog: {idle_secs}s ohne Daten – Reconnect")
                     break
                 continue
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -871,6 +895,12 @@ def listen_forever():
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import signal
+    import atexit
+    signal.signal(signal.SIGTERM, lambda *a: (cleanup_lock(), sys.exit(0)))
+    signal.signal(signal.SIGINT, lambda *a: (cleanup_lock(), sys.exit(0)))
+    atexit.register(cleanup_lock)
+    check_lock()
     log("🚀 VaS 1050 Live-Listener gestartet")
     log(f"📁 Automat: {HOST}:{PORT}")
     log(f"📁 State:   {STATE_FILE}")

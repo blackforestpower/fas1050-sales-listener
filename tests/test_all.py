@@ -346,13 +346,19 @@ if os.path.exists(RAW_LOG) and os.path.getsize(RAW_LOG) > 0:
 else:
     test("raw_stream.log lesbar", False, "Existiert nicht oder ist leer")
 
+import dotenv
+ENV_FILE = os.path.join(PROJECT_DIR, ".env")
+dotenv.load_dotenv(ENV_FILE)
+VAS_HOST = os.environ.get("VAS1050_HOST", "192.168.200.172")
+VAS_PORT = os.environ.get("VAS1050_PORT", "8888")
+
 sock_result = subprocess.run(
     ["timeout", "2", "bash", "-c",
-     "echo > /dev/tcp/192.168.200.146/8888 2>/dev/null && echo OK || echo FAIL"],
+     f"echo > /dev/tcp/{VAS_HOST}/{VAS_PORT} 2>/dev/null && echo OK || echo FAIL"],
     capture_output=True, text=True, timeout=5
 )
 tcp_ok = "OK" in sock_result.stdout
-test("TCP 8888 erreichbar (Automat)", tcp_ok,
+test(f"TCP {VAS_PORT} erreichbar (Automat)", tcp_ok,
      "Automat nicht erreichbar – IP/Port prüfen")
 
 print()
