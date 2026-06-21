@@ -15,11 +15,20 @@ Usage:
 import sqlite3
 import os
 import sys
+import json
 from datetime import datetime, timedelta
+from urllib.request import Request, urlopen
 
-# ── DB ──────────────────────────────────────────────────────
+import dotenv
+
+# ── Config ─────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(SCRIPT_DIR, "data", "sales.db")
+
+# Telegram aus .env laden
+dotenv.load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+TELEGRAM_BOT_TOKEN = os.environ.get("VAS1050_TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("VAS1050_TELEGRAM_CHAT_ID", "-1003979461717")
 
 
 def fmt_eur(cent):
@@ -152,6 +161,23 @@ def build_report(start, end, title):
     return "\n".join(lines)
 
 
+def telegram_send(text):
+    """Sendet den Report per Bot-API in die CAMIRO Bot - Snacks Gruppe"""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML"
+        }).encode()
+        req = Request(url, data=payload, headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"⚠️  Telegram-Fehler: {e}", file=sys.stderr)
+
+
 # ── MAIN ────────────────────────────────────────────────────
 def main():
     heute = datetime.now().strftime("%Y-%m-%d")
@@ -161,19 +187,21 @@ def main():
         gestern = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         start = f"{gestern}T06:00:00"
         end = f"{heute}T06:00:00"
-        print(build_report(start, end, f"Automaten-Zusammenfassung {gestern}"))
+        report = build_report(start, end, f"Automaten-Zusammenfassung {gestern}")
 
     elif "--datum" in sys.argv:
         idx = sys.argv.index("--datum")
         if idx + 1 < len(sys.argv):
             datum = sys.argv[idx + 1]
             morgen = (datetime.strptime(datum, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            print(build_report(f"{datum}T00:00:00", f"{morgen}T00:00:00", f"Tagesumsatz {datum}"))
+            report = build_report(f"{datum}T00:00:00", f"{morgen}T00:00:00", f"Tagesumsatz {datum}")
 
     else:
         # Modus B: Tagesumsatz – heute 00:00 bis jetzt
         jetzt = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        print(build_report(f"{heute}T00:00:00", jetzt, f"Tagesumsatz {heute}"))
+        report = build_report(f"{heute}T00:00:00", jetzt, f"Tagesumsatz {heute}")
+
+    telegram_send(report)
 
 
 if __name__ == "__main__":
