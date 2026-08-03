@@ -14,3 +14,6 @@ backups/
 
 # Token-Datei (alt)
 .telegram_token
+
+# Archive (alte Versionen, nicht versionieren)
+archive/
