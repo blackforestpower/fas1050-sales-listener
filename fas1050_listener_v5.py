@@ -174,7 +174,6 @@ def rotate_log_if_needed():
 
 # ─── SQLite Sales-DB ──────────────────────────────────────────
 DB_FILE = os.path.join(DATA_DIR, "sales.db")
-_CATALOG_CACHE = {}  # wird beim Start geladen
 
 
 def _ensure_sales_table():
@@ -201,14 +200,98 @@ def _ensure_sales_table():
         log(f"⚠️  DB-Fehler (init): {e}")
 
 
+def _ensure_catalog_table():
+    """Stellt sicher, dass die catalog-Tabelle existiert (einmalig beim Start)"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS catalog (
+                slot        TEXT PRIMARY KEY,
+                name        TEXT NOT NULL DEFAULT '',
+                category    TEXT DEFAULT '',
+                group_name  TEXT DEFAULT '',
+                price_cent  INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"⚠️  DB-Fehler (catalog init): {e}")
+
+
+def _migrate_catalog_from_json():
+    """Migriert Daten aus product_catalog.json in die catalog-Tabelle (einmalig)"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        count = conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0]
+        if count > 0:
+            conn.close()
+            log(f"📋 Katalog-DB bereits gefüllt: {count} Einträge")
+            return
+
+        if not os.path.exists(CATALOG_FILE):
+            conn.close()
+            log("⚠️  Kein product_catalog.json für Migration")
+            return
+
+        with open(CATALOG_FILE) as f:
+            catalog = json.load(f)
+
+        inserted = 0
+        for slot_key, entry in catalog.items():
+            name = entry.get("name", "")
+            category = entry.get("group", entry.get("category", ""))
+            group_name = entry.get("group", "")
+            price = entry.get("price", 0)
+            price_cent = int(round(price * 100))
+
+            conn.execute(
+                "INSERT OR REPLACE INTO catalog (slot, name, category, group_name, price_cent) VALUES (?, ?, ?, ?, ?)",
+                (slot_key, name, category, group_name, price_cent)
+            )
+            inserted += 1
+
+        conn.commit()
+        conn.close()
+        log(f"📋 Katalog aus JSON migriert: {inserted} Einträge")
+    except Exception as e:
+        log(f"⚠️  DB-Fehler (catalog migration): {e}")
+
+
+def _get_catalog_entry(slot):
+    """Holt einen Katalog-Eintrag (name, category) aus der DB"""
+    try:
+        if not slot:
+            return None
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        row = conn.execute(
+            "SELECT name, category, group_name, price_cent FROM catalog WHERE slot = ?",
+            (slot,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return {
+                "name": row[0] or "",
+                "category": row[1] or "",
+                "group_name": row[2] or "",
+                "price_cent": row[3]
+            }
+        return None
+    except Exception as e:
+        log(f"⚠️  DB-Fehler (get_catalog): {e}")
+        return None
+
+
 def write_sale_to_db(ts, slot, price_cent, price_eur, payment, credit_before):
     """Schreibt einen Sale in die SQLite-DB (Fehler tolerant)"""
     try:
         product = ""
         category = ""
-        if slot and slot in _CATALOG_CACHE:
-            product = _CATALOG_CACHE[slot].get("name", "")
-            category = _CATALOG_CACHE[slot].get("category", "")
+        if slot:
+            cat = _get_catalog_entry(slot)
+            if cat:
+                product = cat.get("name", "")
+                category = cat.get("category", "")
         
         source = TEST_MODE_SOURCE if TEST_MODE_SOURCE else "listener"
         
@@ -366,12 +449,35 @@ def process_line(line, state, last_state):
             "price_cent": parsed["price_cent"],
             "price_eur": parsed["price_eur"]
         }
+        new_price = val['price_eur']
         old_prices = state.get("prices", {})
         if old_prices.get(slot_num) != val:
             old_prices[slot_num] = val
             state["prices"] = old_prices
             changed = True
-            log(f"🏷  Slot {slot_num}: {val['price_eur']:.2f}€")
+            log(f"🏷  Slot {slot_num}: {new_price:.2f}€")
+            # Preis auch in den Katalog übernehmen (Automat = Ground Truth)
+            new_price_cent = int(round(new_price * 100))
+            try:
+                conn = sqlite3.connect(DB_FILE, timeout=5)
+                conn.execute(
+                    "UPDATE catalog SET price_cent = ?, name = COALESCE(NULLIF(name, ''), name), category = COALESCE(NULLIF(category, ''), category) WHERE slot = ? AND price_cent != ?",
+                    (new_price_cent, slot_num, new_price_cent)
+                )
+                if conn.total_changes > 0:
+                    log(f"📋  Katalog aktualisiert: Slot {slot_num} = {new_price:.2f}€")
+                else:
+                    # Slot existiert noch nicht – neu anlegen (unbekannter Slot)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO catalog (slot, name, category, group_name, price_cent) VALUES (?, '', '', '', ?)",
+                        (slot_num, new_price_cent)
+                    )
+                    if conn.total_changes > 0:
+                        log(f"📋  Neuer Katalog-Eintrag: Slot {slot_num} = {new_price:.2f}€")
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                log(f"⚠️  DB-Fehler (price update): {e}")
 
     # ── Temperaturen ───────────────────────────────────────
     # gettemperature: Zone 1 (Spirale), gettemperaturetwo: Zone 2 (Türen/Getränke)
@@ -395,10 +501,13 @@ def process_line(line, state, last_state):
             "count": parsed["error_count"]
         }
         if state.get("errors") != err:
+            old_err = state.get("errors")
             state["errors"] = err
             changed = True
             log(f"⚠️  Fehler: Byte={err['byte']} Code={err['code']} "
                 f"Count={err['count']}")
+            # Fehler-Wechsel (aktiv/behoben) → Telegram-Alert
+            detect_error_change(state, old_err, err)
 
 
     # ── Verkaufsstatus ─────────────────────────────────────
@@ -439,6 +548,9 @@ def process_line(line, state, last_state):
 
     # Verkaufserkennung + Telegram (bei jeder readcredit-Zeile)
     detect_sale(line, parsed, state)
+    
+    # Reboot-Erkennung (readpar/writeclock nach Datenlücke)
+    detect_reboot(cmd, parsed, state)
 
 
 def save_state(state):
@@ -483,9 +595,58 @@ sale_credit_before = 0    # Kredit-Wert bei erog
 sale_is_card = False      # Wurde 4900 (Karte) gesehen?
 sale_credit_price = None  # Preis aus erstem Kredit-Drop während erog (Cash)
 
+# ── Reboot-Erkennung ─────────────────────────────────────────
+last_data_ts = 0          # Zeitstempel der letzten Datenzeile
+reboot_notified = False   # Ob wir für aktuellen Boot bereits benachrichtigt haben
+readpar_count = 0          # Zähler für readpar-Burst während Boot
+reboot_cooldown_ts = 0    # Cooldown: frühester nächster Reboot-Alarm
+
+
+def detect_reboot(cmd, parsed, state):
+    """
+    Erkennt einen Automat-Neustart anhand der Boot-Sequenz:
+    Nach einem Stromausfall sendet der Automat einen Burst von
+    readpar-Befehlen + writeclock + commandsversion.
+    Diese Befehle kommen im Normalbetrieb NIE vor.
+    """
+    global last_data_ts, reboot_notified, readpar_count, reboot_cooldown_ts
+    
+    now = time.time()
+    
+    # readpar = klares Boot-Signal (kommt nur beim Neustart)
+    if cmd.startswith("readpar ") or cmd.startswith("writeclock"):
+        gap = now - last_data_ts if last_data_ts > 0 else 999
+        
+        # Mindestens 60s seit letzter Datenzeile = Reboot
+        if gap > 60 and not reboot_notified and now > reboot_cooldown_ts:
+            reboot_notified = True
+            
+            # Temperatur vor Reboot merken falls verfügbar
+            temps = state.get("temperatures", {})
+            z1 = temps.get("zone1", "?")
+            z2 = temps.get("zone2", "?")
+            
+            gap_min = int(gap // 60)
+            gap_sec = int(gap % 60)
+            
+            msg = (
+                f"⚡ <b>Automat-Neustart erkannt!</b>\n"
+                f"⏱ Ca. {gap_min}:{gap_sec:02d} Min offline\n"
+                f"🔄 Boot um {datetime.now().strftime('%H:%M:%S')} Uhr\n"
+                f"🌡 Zone 1: {z1}°C | Zone 2: {z2}°C"
+            )
+            telegram_send(msg)
+            log(f"⚡ REBOOT: {gap_min}m{gap_sec}s offline – Telegram gesendet")
+    
+    last_data_ts = now  # Immer aktualisieren
+    
+    # Nach 30s ohne readpar zurücksetzen (nächster Reboot erkennbar)
+    if not cmd.startswith("readpar ") and reboot_notified:
+        readpar_count = 0
+
 
 def telegram_send(text):
-    """Sendet eine Nachricht an die Trading-Gruppe via Bot-API"""
+    """Sendet eine Nachricht via Bot-API (konfigurierter Chat)"""
     if not TELEGRAM_ENABLED:
         return
     try:
@@ -500,6 +661,87 @@ def telegram_send(text):
         urlopen(req, timeout=10)
     except Exception as e:
         log(f"⚠️  Telegram-Fehler: {e}")
+
+
+# ── Fehler-Erkennung + Telegram-Alert ────────────────────────
+# Bekannte Fehlercodes (Byte/Code) – wird bei Bedarf erweitert
+ERROR_DESCRIPTIONS = {
+    (41, 54): "Blockade in der Ausgabe (Produkt klemmt?)",
+    (16, 1): "Unbekannter Fehler (16/1)",
+    (32, 0): "Unbekannter Fehler (32/0)",
+}
+
+error_alert_timestamps = {}  # key "byte/code" -> letzter Alert-Zeitstempel
+ERROR_ALERT_COOLDOWN = 600   # gleicher Fehler max. alle 10 Min melden
+
+
+def detect_error_change(state, old_err, err):
+    """
+    Meldet Fehler-Wechsel nach Telegram:
+    - kein Fehler → Fehler:   "⚠️ Automat meldet Fehler"
+    - Fehler → kein Fehler:   "✅ Fehler behoben"
+    - Erster Wert nach Start: wird nur gemerkt, NICHT gemeldet
+      (verhindert Fehlalarme für alte, längst bekannte Fehler)
+    """
+    if old_err is None:
+        return  # Baseline nach Listener-Start – nicht alerteen
+
+    old_active = old_err.get("byte") != 0 or old_err.get("code") != 0
+    new_active = err.get("byte") != 0 or err.get("code") != 0
+
+    if old_active == new_active:
+        return  # kein aktiv/inaktiv-Wechsel
+
+    now = time.time()
+    now_str = datetime.now().strftime("%H:%M")
+    temps = state.get("temperatures", {})
+    z1 = temps.get("zone1", "?")
+    z2 = temps.get("zone2", "?")
+
+    if new_active:
+        # Cooldown nur für AKTIV-Meldungen (Spam-Schutz bei Dauerfehler)
+        key = f"{err['byte']}/{err['code']}"
+        if now - error_alert_timestamps.get(key, 0) < ERROR_ALERT_COOLDOWN:
+            return
+        error_alert_timestamps[key] = now
+
+        desc = ERROR_DESCRIPTIONS.get((err["byte"], err["code"]), "Unbekannter Fehler")
+        msg = (
+            f"⚠️ <b>Automat meldet Fehler!</b>\n"
+            f"🔧 Code: {err['byte']}/{err['code']} ({desc})\n"
+            f"🕒 {now_str} Uhr\n"
+            f"🌡 Zone 1: {z1}°C | Zone 2: {z2}°C"
+        )
+        telegram_send(msg)
+        log(f"⚠️ Fehler-Alert gesendet: {err['byte']}/{err['code']}")
+    else:
+        # „Behoben“ wird IMMER gemeldet – ist ein einmaliges Signal pro Fehler-Phase
+        desc = ERROR_DESCRIPTIONS.get((old_err["byte"], old_err["code"]), "Unbekannter Fehler")
+        msg = (
+            f"✅ <b>Fehler behoben!</b>\n"
+            f"🔧 Code: {old_err['byte']}/{old_err['code']} ({desc})\n"
+            f"🕒 {now_str} Uhr\n"
+            f"🌡 Zone 1: {z1}°C | Zone 2: {z2}°C"
+        )
+        telegram_send(msg)
+        log(f"✅ Fehler-behoben-Alert gesendet: {old_err['byte']}/{old_err['code']}")
+
+
+def _get_today_total(db_path, today_prefix, current_amount_eur):
+    """Summiert heutige Verkäufe inkl. des aktuellen."""
+    total = float(current_amount_eur)
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(price_eur), 0) FROM sales WHERE timestamp LIKE ?",
+            (today_prefix + "%",)
+        )
+        total += float(cur.fetchone()[0])
+        conn.close()
+    except Exception:
+        pass
+    return round(total, 2)
 
 
 def _finalize_sale(state, now, current_sale_slot, price, payment_type, credit_before):
@@ -525,12 +767,16 @@ def _finalize_sale(state, now, current_sale_slot, price, payment_type, credit_be
     
     product_name = None
     if current_sale_slot:
-        cat_entry = state.get("catalog", {}).get(str(current_sale_slot))
+        cat_entry = _get_catalog_entry(str(current_sale_slot))
         if cat_entry:
             product_name = cat_entry.get("name")
     
+    # Tagesumsatz (inkl. dieses Verkaufs)
+    today_prefix = now.strftime("%Y-%m-%dT")
+    daily_total = _get_today_total(DB_FILE, today_prefix, amount_eur)
+    
     msg = (
-        f"🛒 <b>Verkauf am Automaten! ({now.strftime('%H:%M')} Uhr)</b>\n"
+        f"🛒 <b>Verkauf ({now.strftime('%H:%M')} Uhr)</b>\n"
         f"💰 {amount_eur:.2f}€ {pay_icon}\n"
         f"📍 {slot_str}"
     )
@@ -538,6 +784,7 @@ def _finalize_sale(state, now, current_sale_slot, price, payment_type, credit_be
         msg += f" — {product_name}\n"
     else:
         msg += "\n"
+    msg += f"📊 Tagesumsatz: {daily_total:.2f}€\n"
     msg += f"🌡  Zone 1: {z1}°C | Zone 2: {z2}°C"
     telegram_send(msg)
     log(f"📨 Telegram: {amount_eur:.2f}€ {slot_str}")
@@ -550,6 +797,21 @@ def _finalize_sale(state, now, current_sale_slot, price, payment_type, credit_be
         payment=payment_type,
         credit_before=credit_before
     )
+    
+    # Preis-Mirror: tatsächlich gezahlten Preis in den Catalog schreiben
+    if current_sale_slot:
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=5)
+            conn.execute(
+                "UPDATE catalog SET price_cent = ? WHERE slot = ? AND price_cent != ?",
+                (price, current_sale_slot, price)
+            )
+            if conn.total_changes > 0:
+                log(f"📋  Catalog-Preis gespiegelt: Slot {current_sale_slot} = {amount_eur:.2f}€")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log(f"⚠️  DB-Fehler (catalog price mirror): {e}")
 
 
 def detect_sale(line, parsed, state):
@@ -647,23 +909,23 @@ def detect_sale(line, parsed, state):
                         slot_idx = str(current_sale_slot) if current_sale_slot else None
                         price = None
                         
-                        # PRIO 1: viewprice (wenn Slot zuerst, dann Karte)
-                        if sale_price_cent and 1 <= sale_price_cent <= 10000:
-                            price = sale_price_cent
-                            log(f"   💳 Kartenzahlung {price} Cent (viewprice, Slot {slot_idx})")
-                        
-                        # PRIO 2: Preiscache (wenn viewprice fehlt, z.B. Karte vor Slot)
-                        if price is None and slot_idx:
+                        # PRIO 1: Preiscache (Slot-Tabelle) — zuverlässig, nicht von hängendem viewprice beeinflusst
+                        if slot_idx:
                             prices = state.get("prices", {})
                             slot_price = prices.get(slot_idx, {}).get("price_cent")
                             if slot_price and 1 <= slot_price <= 10000:
                                 price = slot_price
                                 log(f"   💳 Kartenzahlung {price} Cent (Preiscache Slot {slot_idx})")
                         
+                        # PRIO 2: viewprice (Fallback, wenn Slot nicht in Preistabelle)
+                        if price is None and sale_price_cent and 1 <= sale_price_cent <= 10000:
+                            price = sale_price_cent
+                            log(f"   💳 Kartenzahlung {price} Cent (viewprice, Slot {slot_idx})")
+                        
                         # PRIO 3: Kredit-Differenz (wenn beides fehlschlägt)
                         if price is None and sale_credit_price:
                             # 4900 = volle Kartengutschrift kann nie der Preis sein
-                            if sale_is_card and sale_credit_price == 4900:
+                            if sale_credit_price == 4900:
                                 log(f"   ⚠️  Kredit-Drop = 4900 (volle Reserve, kein Preis)")
                             else:
                                 price = sale_credit_price
@@ -705,8 +967,16 @@ def detect_sale(line, parsed, state):
                         slot_idx = str(current_sale_slot) if current_sale_slot else None
                         price = None
                         
+                        # PRIO 0: Preiscache (zuverlässigster Weg, siehe enderog-Handler)
+                        if slot_idx:
+                            prices = state.get("prices", {})
+                            slot_price = prices.get(slot_idx, {}).get("price_cent")
+                            if slot_price and 1 <= slot_price <= 10000:
+                                price = slot_price
+                                log(f"   💳 Kartenzahlung {price} Cent (Preiscache, {slot_idx}, take)")
+                        
                         # PRIO 1: viewprice
-                        if sale_price_cent and 1 <= sale_price_cent <= 10000:
+                        if price is None and sale_price_cent and 1 <= sale_price_cent <= 10000:
                             price = sale_price_cent
                             log(f"   💳 Kartenzahlung {price} Cent (viewprice, {slot_idx}, take)")
                         
@@ -742,6 +1012,17 @@ def detect_sale(line, parsed, state):
                 else:
                     log(f"⏭  take ohne erog in 45s - ignoriert")
                 
+                sale_in_progress = False
+                sale_price_cent = 0
+                sale_credit_before = 0
+                sale_is_card = False
+                sale_credit_price = None
+                current_sale_slot = None
+
+        # ── Automat in "other" – Sale abgebrochen ───────────
+        if new_state.startswith("other"):
+            if sale_in_progress:
+                log(f"   ⚠️  Automat in 'other' – Sale abgebrochen (Slot {current_sale_slot})")
                 sale_in_progress = False
                 sale_price_cent = 0
                 sale_credit_before = 0
@@ -789,19 +1070,16 @@ def listen_forever():
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     
-    # Produkt-Katalog laden (globaler Cache für DB-Writes)
-    global _CATALOG_CACHE
-    state["catalog"] = {}
-    try:
-        with open(CATALOG_FILE) as f:
-            state["catalog"] = json.load(f)
-            _CATALOG_CACHE = state["catalog"]
-        log(f"📦 Produkt-Katalog geladen: {len(state['catalog'])} Einträge")
-    except (FileNotFoundError, json.JSONDecodeError):
-        log("⚠️  Kein Produkt-Katalog (product_catalog.json) – Verkäufe ohne Produktnamen")
-
-    # SQLite-DB initialisieren (Tabelle anlegen falls nicht vorhanden)
+    # SQLite-DB initialisieren (Tabellen anlegen falls nicht vorhanden)
     _ensure_sales_table()
+    _ensure_catalog_table()
+    _migrate_catalog_from_json()
+
+    # Reboot-Detection zurücksetzen (nach Neustart des Listeners)
+    global last_data_ts, reboot_notified, readpar_count
+    last_data_ts = time.time()
+    reboot_notified = False
+    readpar_count = 0
 
     while True:
         # ── Verbinden ───────────────────────────────────────
