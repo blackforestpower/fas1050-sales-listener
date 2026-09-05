@@ -17,3 +17,9 @@ backups/
 
 # Archive (alte Versionen, nicht versionieren)
 archive/
+
+# Import-CSVs (Inventar-Exporte, keine Versionierung)
+import/
+
+# Altes Test-Artefakt (Roh-Log, nicht referenziert)
+tests/raw_stream_20260614_1854-1900.log
