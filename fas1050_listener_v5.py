@@ -518,6 +518,9 @@ def process_line(line, state, last_state):
             state["selstate"] = val
             changed = True
             log(f"📋  Status: {old_val} → {val}")
+        # Stuck-State-Watchdog: bei JEDER selstate-Zeile prüfen
+        # (reiner Beobachter – kein Eingriff in die Verkaufserkennung)
+        stuck_watchdog(val)
 
     # ── Guthaben / Verkaufszähler ──────────────────────────
     elif "readcredit" in cmd:
@@ -725,6 +728,106 @@ def detect_error_change(state, old_err, err):
         )
         telegram_send(msg)
         log(f"✅ Fehler-behoben-Alert gesendet: {old_err['byte']}/{old_err['code']}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STUCK-STATE-WATCHDOG (Blockade-Erkennung)
+# ═══════════════════════════════════════════════════════════════
+#  Erkennt hängende MECHANISCHE Zustände (z.B. dauerhaft "take"):
+#  Wenn selstate länger als STUCK_ALERT_DELAY_S ununterbrochen in einem
+#  Blockade-Zustand hängt → Telegram-Warnung, danach stündliche
+#  Wiederholung, bis der Automat wieder auf "enderog" ist ("behoben").
+#
+#  WICHTIG (seit 05.09.2026): Nur take/busy/erog sind echte Blockade-
+#  Zustände! viewprice (Preisanzeige) und ageprotection (Alterscheck)
+#  blockieren den Automaten NICHT – Kunden können dort normal kaufen
+#  (bestätigt vor Ort). Diese Zustände lösen daher KEINE Alarme aus.
+#  Reiner Beobachter – fasst Verkaufserkennung/DB nicht an.
+STUCK_ALERT_DELAY_S = 300        # 5 Minuten im Blockade-Zustand → 1. Warnung
+STUCK_REPEAT_INTERVAL_S = 3600   # weitere Warnungen stündlich
+# Nur diese Zustände blockieren den Verkauf wirklich (Mechanik hängt):
+STUCK_WATCH_STATES = {"take", "busy", "erog"}
+
+stuck_phase_start = 0.0    # epoch: Beginn der Blockade-Episode (für Dauer-Meldung)
+stuck_since_ts = 0.0       # epoch: Beginn des aktuellen ununterbrochenen Zustands
+stuck_state_label = None   # aktueller Blockade-Zustand
+stuck_alert_sent = False   # Warnung in dieser Episode schon gesendet?
+stuck_last_alert_ts = 0.0  # epoch der letzten Warnung
+
+
+def stuck_watchdog(val):
+    """
+    Wird bei JEDER selstate-Zeile aufgerufen (auch ohne Zustandswechsel).
+    val = erster Wert aus selstate (z.B. "take", "busy", "enderog").
+    """
+    global stuck_phase_start, stuck_since_ts, stuck_state_label
+    global stuck_alert_sent, stuck_last_alert_ts
+    now = time.time()
+
+    if val == "enderog":
+        # Automat wieder bereit – blockierte Episode beenden
+        if stuck_alert_sent:
+            dur_min = int((now - stuck_phase_start) // 60) if stuck_phase_start else 0
+            msg = (
+                f"✅ <b>Automat wieder bereit</b>\n"
+                f"Zustand „{stuck_state_label}“ war ca. {dur_min} Min blockiert"
+            )
+            telegram_send(msg)
+            log(f"✅ Stuck-State beendet ({stuck_state_label}, ~{dur_min} min)")
+        stuck_phase_start = 0.0
+        stuck_since_ts = 0.0
+        stuck_state_label = None
+        stuck_alert_sent = False
+        stuck_last_alert_ts = 0.0
+        return
+
+    # Nur mechanische Blockade-Zustände überwachen. viewprice/ageprotection
+    # (und andere Anzeige-/Wartezustände) blockieren NICHT → Timer stoppen,
+    # aber keine "behoben"-Meldung (die kommt erst bei enderog).
+    if val not in STUCK_WATCH_STATES:
+        stuck_since_ts = 0.0
+        return
+
+    if stuck_state_label != val:
+        # Neuer Blockade-Zustand (bzw. Wechsel innerhalb take/busy/erog):
+        # Zustands-Timer neu starten, Episoden-Beginn nur einmal setzen.
+        if stuck_phase_start == 0.0:
+            stuck_phase_start = now
+        stuck_since_ts = now
+        stuck_state_label = val
+        return
+
+    # Gleicher Blockade-Zustand hält ununterbrochen an
+    dur_s = now - stuck_since_ts
+    if dur_s < STUCK_ALERT_DELAY_S:
+        return
+
+    if not stuck_alert_sent:
+        # Erste Warnung nach 5 Minuten
+        stuck_alert_sent = True
+        stuck_last_alert_ts = now
+        _send_stuck_alert(val, dur_s, repeat=False)
+    elif now - stuck_last_alert_ts >= STUCK_REPEAT_INTERVAL_S:
+        # Stündliche Wiederholung, solange blockiert
+        stuck_last_alert_ts = now
+        _send_stuck_alert(val, dur_s, repeat=True)
+
+
+def _send_stuck_alert(val, dur_s, repeat):
+    """Telegram-Warnung für eine anhaltende Blockade (1. Alarm/Wiederholung)."""
+    dur_min = int(dur_s // 60)
+    dur_txt = f"{dur_min // 60} h {dur_min % 60} min" if dur_min >= 60 else f"{dur_min} min"
+    prefix = ("🔁 <b>Automat weiterhin blockiert</b>" if repeat
+              else "⚠️ <b>Automat blockiert?</b>")
+    msg = (
+        f"{prefix}\n"
+        f"🚦 Zustand: {val}\n"
+        f"⏱ Bereits ~{dur_txt} nicht auf „bereit“\n"
+        f"🕒 {datetime.now().strftime('%H:%M')} Uhr\n"
+        f"🔧 Automat/Entnahmefach prüfen!"
+    )
+    telegram_send(msg)
+    log(f"{'🔁' if repeat else '⚠️'} Stuck-Alert: {val} seit ~{dur_txt}")
 
 
 def _get_today_total(db_path, today_prefix, current_amount_eur):
