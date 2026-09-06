@@ -750,7 +750,8 @@ STUCK_WATCH_STATES = {"take", "busy", "erog"}
 
 stuck_phase_start = 0.0    # epoch: Beginn der Blockade-Episode (für Dauer-Meldung)
 stuck_since_ts = 0.0       # epoch: Beginn des aktuellen ununterbrochenen Zustands
-stuck_state_label = None   # aktueller Blockade-Zustand
+stuck_state_label = None   # aktueller Blockade-Zustand (Timer-Logik)
+stuck_alert_label = None   # Zustand, für den der letzte Alarm galt ("behoben"-Text)
 stuck_alert_sent = False   # Warnung in dieser Episode schon gesendet?
 stuck_last_alert_ts = 0.0  # epoch der letzten Warnung
 
@@ -761,36 +762,42 @@ def stuck_watchdog(val):
     val = erster Wert aus selstate (z.B. "take", "busy", "enderog").
     """
     global stuck_phase_start, stuck_since_ts, stuck_state_label
-    global stuck_alert_sent, stuck_last_alert_ts
+    global stuck_alert_label, stuck_alert_sent, stuck_last_alert_ts
     now = time.time()
 
     if val == "enderog":
         # Automat wieder bereit – blockierte Episode beenden
         if stuck_alert_sent:
             dur_min = int((now - stuck_phase_start) // 60) if stuck_phase_start else 0
+            alert_label = stuck_alert_label or stuck_state_label or "?"
             msg = (
                 f"✅ <b>Automat wieder bereit</b>\n"
-                f"Zustand „{stuck_state_label}“ war ca. {dur_min} Min blockiert"
+                f"Zustand „{alert_label}“ war ca. {dur_min} Min blockiert"
             )
             telegram_send(msg)
-            log(f"✅ Stuck-State beendet ({stuck_state_label}, ~{dur_min} min)")
+            log(f"✅ Stuck-State beendet ({alert_label}, ~{dur_min} min)")
         stuck_phase_start = 0.0
         stuck_since_ts = 0.0
         stuck_state_label = None
+        stuck_alert_label = None
         stuck_alert_sent = False
         stuck_last_alert_ts = 0.0
         return
 
     # Nur mechanische Blockade-Zustände überwachen. viewprice/ageprotection
-    # (und andere Anzeige-/Wartezustände) blockieren NICHT → Timer stoppen,
-    # aber keine "behoben"-Meldung (die kommt erst bei enderog).
+    # (und andere Anzeige-/Wartezustände) blockieren NICHT → Timer UND
+    # Zustands-Label zurücksetzen (Unterbrechung der Blockade-Phase),
+    # damit der nächste Blockade-Zustand frisch startet. Keine
+    # "behoben"-Meldung hier – die kommt erst bei enderog.
     if val not in STUCK_WATCH_STATES:
         stuck_since_ts = 0.0
+        stuck_state_label = None
         return
 
-    if stuck_state_label != val:
-        # Neuer Blockade-Zustand (bzw. Wechsel innerhalb take/busy/erog):
-        # Zustands-Timer neu starten, Episoden-Beginn nur einmal setzen.
+    if stuck_state_label != val or stuck_since_ts == 0.0:
+        # Neuer Blockade-Zustand ODER Timer wurde durch einen Zwischenzustand
+        # (z.B. viewprice) zurückgesetzt → Timer frisch starten.
+        # Episoden-Beginn nur einmal setzen (für die "behoben"-Dauer).
         if stuck_phase_start == 0.0:
             stuck_phase_start = now
         stuck_since_ts = now
@@ -805,6 +812,7 @@ def stuck_watchdog(val):
     if not stuck_alert_sent:
         # Erste Warnung nach 5 Minuten
         stuck_alert_sent = True
+        stuck_alert_label = val
         stuck_last_alert_ts = now
         _send_stuck_alert(val, dur_s, repeat=False)
     elif now - stuck_last_alert_ts >= STUCK_REPEAT_INTERVAL_S:
