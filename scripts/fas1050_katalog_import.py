@@ -125,7 +125,8 @@ def build_catalog(csv_products, live_prices, old_catalog):
     Merged CSV + Live-Preise + alten Katalog.
     Priorität:
       - Name + Gruppe: aus CSV
-      - Preis: aus current_state (live) > CSV > alter Katalog
+      - Preis: NUR aus current_state (Listener live) > alter Katalog
+        (NIEMALS aus der CSV – Preise kommen immer vom Listener!)
     """
     catalog = {}
 
@@ -139,9 +140,9 @@ def build_catalog(csv_products, live_prices, old_catalog):
         if price_cent is not None:
             price_eur = live_price.get("price_eur", round(price_cent / 100, 2))
         else:
-            # Fallback: CSV-Preis in Cent
-            price_cent = int(round(info["price_csv"] * 100))
-            price_eur = info["price_csv"]
+            # KEIN CSV-Preis! Fallback: bisheriger Katalogwert (vom Listener gepflegt)
+            old_info = (old_catalog or {}).get(slot_key, {})
+            price_eur = old_info.get("price", 0)
 
         catalog[slot_key] = {
             "name": info["name"],
