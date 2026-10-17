@@ -53,6 +53,20 @@ def get_sales(start, end):
     return rows
 
 
+def count_unsold_slots(start, end):
+    """Katalog-Slots gesamt + wie viele davon im Zeitraum gar nicht verkauft wurden."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0]
+        sold = conn.execute(
+            "SELECT COUNT(DISTINCT slot) FROM sales WHERE timestamp >= ? AND timestamp < ?",
+            (start, end)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return total, max(total - sold, 0)
+
+
 # ── Kategorie-Definitionen ──────────────────────────────────
 # Anzeige-Reihenfolge (vereinfachte Namen ohne MwSt-Suffix)
 CAT_ORDER = [
@@ -157,6 +171,21 @@ def build_report(start, end, title):
     lines.append(f"  💳 Karte:  {card_count:2d}x  {fmt_eur(card_cent):>8s}")
     lines.append(f"  {'─' * 50}")
     lines.append(f"  💰 Total:  {card_count + cash_count:2d}x  {fmt_eur(total_cent):>8s}")
+
+    # ── Flop 3 ("Penner-Liste"): am wenigsten verkaufte Produkte ──
+    prod_counts = {}
+    for r in rows:
+        name = r[2] or "(unbekannt)"
+        prod_counts[name] = prod_counts.get(name, 0) + 1
+    flop = sorted(prod_counts.items(), key=lambda x: (x[1], x[0]))[:3]
+    if flop:
+        lines.append("")
+        lines.append("  🐌 Flop 3 (am wenigsten verkauft):")
+        for name, n in flop:
+            lines.append(f"    • {name} – {n}x")
+        total_slots, unsold = count_unsold_slots(start, end)
+        if total_slots:
+            lines.append(f"    😴 Ohne Verkauf: {unsold} von {total_slots} Slots")
 
     return "\n".join(lines)
 

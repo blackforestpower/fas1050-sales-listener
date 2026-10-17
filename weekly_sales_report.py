@@ -52,6 +52,20 @@ def get_sales(start, end):
     return rows
 
 
+def count_unsold_slots(start_str, end_str):
+    """Katalog-Slots gesamt + wie viele davon im Zeitraum gar nicht verkauft wurden."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM catalog").fetchone()[0]
+        sold = conn.execute(
+            "SELECT COUNT(DISTINCT slot) FROM sales WHERE timestamp >= ? AND timestamp < ?",
+            (start_str, end_str)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return total, max(total - sold, 0)
+
+
 # ── Daten abrufen ──────────────────────────────────────────
 def analyze_period(start_str, end_str):
     rows = get_sales(start_str, end_str)
@@ -73,6 +87,10 @@ def analyze_period(start_str, end_str):
     avg_daily = total_eur / max(len(daily_totals), 1)
 
     top3 = sorted(product_counts.items(), key=lambda x: -x[1]["count"])[:3]
+    # Flop 3 ("Penner-Liste"): die am wenigsten verkauften Produkte des Zeitraums
+    flop3 = sorted(product_counts.items(),
+                   key=lambda x: (x[1]["count"], x[1]["total"], x[0]))[:3]
+    slots_total, slots_unsold = count_unsold_slots(start_str, end_str)
 
     return {
         "daily_totals": dict(daily_totals),
@@ -80,6 +98,9 @@ def analyze_period(start_str, end_str):
         "num_tx": num_tx,
         "avg_daily": avg_daily,
         "top3": top3,
+        "flop3": flop3,
+        "slots_total": slots_total,
+        "slots_unsold": slots_unsold,
     }
 
 
@@ -232,6 +253,15 @@ def build_caption(this_week, start_date, end_date, prev_total, month_total=0, th
     for i, (prod, data) in enumerate(this_week["top3"]):
         lines.append(f"{medals[i]} {prod} - {data['count']}x ({fmt_eur_de(data['total'])})")
     lines.append("")
+
+    # Flop 3 ("Penner-Liste")
+    if this_week.get("flop3"):
+        lines.append("\U0001f40c <b>Flop 3 (am wenigsten verkauft):</b>")
+        for prod, data in this_week["flop3"]:
+            lines.append(f"\u2022 {prod} \u2013 {data['count']}x ({fmt_eur_de(data['total'])})")
+        if this_week.get("slots_total"):
+            lines.append(f"\U0001f634 Ohne Verkauf: {this_week['slots_unsold']} von {this_week['slots_total']} Slots")
+        lines.append("")
 
     # Monatsumsatz
     lines.append(f"\U0001f4c5 <b>Monatsumsatz:</b> {fmt_eur_de(month_total)}")
