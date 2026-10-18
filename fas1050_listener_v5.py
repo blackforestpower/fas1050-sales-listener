@@ -492,6 +492,8 @@ def process_line(line, state, last_state):
             changed = True
             zone_label = "Zone 2" if zone == "zone2" else "Zone 1"
             log(f"🌡  {zone_label}: {temp_c}°C")
+        # Temperatur-Watchdog: bei JEDER Temperatur-Zeile prüfen
+        temp_watchdog(zone, temp_c)
 
     # ── Fehler ──────────────────────────────────────────────
     elif "readerrors" in cmd:
@@ -836,6 +838,89 @@ def _send_stuck_alert(val, dur_s, repeat):
     )
     telegram_send(msg)
     log(f"{'🔁' if repeat else '⚠️'} Stuck-Alert: {val} seit ~{dur_txt}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TEMPERATUR-WATCHDOG (Tür offen / Kühlung defekt)
+# ═══════════════════════════════════════════════════════════════
+#  Erkennt offene Tür bzw. ausfallende Kühlung: Steigt die Zonen-
+#  Temperatur über TEMP_WARN_C und bleibt dort (>30 Min), kommt eine
+#  Telegram-Warnung – danach alle 2 h. Fällt sie wieder klar unter
+#  TEMP_RECOVER_C, kommt eine Entwarnung.
+#  Hintergrund 18.10.2026: Automat stand 11,5 h in ageprotection, Tür
+#  war offen, Zone 1 stieg von 9,5 auf 12,3 °C – ohne Alarm.
+#  Reiner Beobachter – fasst Verkaufserkennung/DB nicht an.
+TEMP_WARN_C = 10.5            # Zone normal 7–10 °C → ab 10,5 °C verdächtig
+TEMP_RECOVER_C = 9.5          # wieder normal
+TEMP_ALERT_DELAY_S = 1800     # 30 Min zu warm → 1. Warnung
+TEMP_RECOVER_DELAY_S = 600    # 10 Min wieder normal → Entwarnung
+TEMP_REPEAT_INTERVAL_S = 7200 # Wiederholung alle 2 h
+
+temp_watch = {}  # zone -> dict(above_since, below_since, alerted, last_alert, peak)
+
+
+def temp_watchdog(zone, temp_c):
+    """Wird bei jeder Temperatur-Zeile aufgerufen (zone: 'zone1'/'zone2')."""
+    if temp_c is None:
+        return
+    now = time.time()
+    st = temp_watch.setdefault(zone, {
+        "above_since": 0.0, "below_since": 0.0,
+        "alerted": False, "last_alert": 0.0, "peak": temp_c,
+    })
+    label = "Zone 2" if zone == "zone2" else "Zone 1"
+
+    if temp_c >= TEMP_WARN_C:
+        st["below_since"] = 0.0
+        if st["above_since"] == 0.0:
+            st["above_since"] = now
+            st["peak"] = temp_c
+        st["peak"] = max(st["peak"], temp_c)
+        warm_s = now - st["above_since"]
+        if warm_s < TEMP_ALERT_DELAY_S:
+            return
+        warm_txt = f"{int(warm_s // 60)} Min"
+        peak_txt = f"{st['peak']:.1f}".replace(".", ",")
+        if not st["alerted"]:
+            st["alerted"] = True
+            st["last_alert"] = now
+            telegram_send(
+                f"🌡 <b>Automat zu warm – Tür offen?</b>\n"
+                f"{label}: {temp_c:.1f} °C (Peak {peak_txt} °C)\n"
+                f"⏱ Seit ~{warm_txt} über {TEMP_WARN_C:.1f} °C\n"
+                f"🕒 {datetime.now().strftime('%H:%M')} Uhr\n"
+                f"🔧 Tür prüfen / Kühlung kontrollieren!"
+            )
+            log(f"🌡 Temperatur-Alert: {label} {temp_c:.1f}°C seit ~{warm_txt}")
+        elif now - st["last_alert"] >= TEMP_REPEAT_INTERVAL_S:
+            st["last_alert"] = now
+            telegram_send(
+                f"🔁 <b>Weiterhin zu warm</b>\n"
+                f"{label}: {temp_c:.1f} °C (Peak {peak_txt} °C)\n"
+                f"⏱ Seit ~{warm_txt} über {TEMP_WARN_C:.1f} °C\n"
+                f"🔧 Tür/Kühlung prüfen!"
+            )
+            log(f"🔁 Temperatur-Alert wiederholt: {label} {temp_c:.1f}°C")
+        return
+
+    # Unter Warnschwelle
+    st["above_since"] = 0.0
+    if temp_c <= TEMP_RECOVER_C:
+        if st["below_since"] == 0.0:
+            st["below_since"] = now
+        if st["alerted"] and now - st["below_since"] >= TEMP_RECOVER_DELAY_S:
+            telegram_send(
+                f"✅ <b>Temperatur wieder normal</b>\n"
+                f"{label}: {temp_c:.1f} °C\n"
+                f"🕒 {datetime.now().strftime('%H:%M')} Uhr"
+            )
+            log(f"✅ Temperatur wieder normal: {label} {temp_c:.1f}°C")
+            temp_watch[zone] = {
+                "above_since": 0.0, "below_since": 0.0,
+                "alerted": False, "last_alert": 0.0, "peak": temp_c,
+            }
+    else:
+        st["below_since"] = 0.0
 
 
 def _get_today_total(db_path, today_prefix, current_amount_eur):
