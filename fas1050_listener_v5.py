@@ -544,6 +544,11 @@ def process_line(line, state, last_state):
             f"{c['year']} {c['hour']:02d}:{c['minute']:02d}:"
             f"{c['second']:02d}")
 
+    # ── Tür-/Blockade-Events (getblock, DEX) ───────────────
+    elif "getblock" in cmd:
+        # Die DEX-Nutzzeile enthält "EA1"; die leere "ack"-Zeile ignorieren.
+        block_watchdog(line)
+
     # Bei Änderung speichern
     if changed:
         state["last_seen"] = datetime.now().isoformat()
@@ -554,6 +559,9 @@ def process_line(line, state, last_state):
     
     # Reboot-Erkennung (readpar/writeclock nach Datenlücke)
     detect_reboot(cmd, parsed, state)
+
+    # Tür-/Blockade-Watchdog: Schwelle/Wiederholung zeitbasiert prüfen
+    block_watchdog_tick()
 
 
 def save_state(state):
@@ -836,6 +844,141 @@ def _send_stuck_alert(val, dur_s, repeat):
     )
     telegram_send(msg)
     log(f"{'🔁' if repeat else '⚠️'} Stuck-Alert: {val} seit ~{dur_txt}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TÜR-/BLOCKADE-WATCHDOG (getblock-Events)
+# ═══════════════════════════════════════════════════════════════
+#  Der Automat meldet Tür-/Blockade-Zustände als getblock-DEX-Zeilen:
+#    • Öffnen  : EA2 endet auf ****1  oder EA1-Code endet auf …S (z. B. EGS)
+#    • Schließen: EA2 endet auf ****0  oder EA1-Code endet auf …T (z. B. EGT)
+#  Bleibt die Tür > 15 Minuten offen → Telegram-Warnung (danach stündlich),
+#  beim Schließen eine Entwarnung. Kurze Öffnungen (Befüllen) bleiben still.
+#  Reiner Beobachter – fasst Verkaufserkennung/DB nicht an.
+BLOCK_ALERT_DELAY_S = 900       # 15 Min offen → 1. Warnung
+BLOCK_REPEAT_INTERVAL_S = 3600  # danach stündlich
+
+block_since_ts = 0.0
+block_alert_sent = False
+block_last_alert_ts = 0.0
+
+
+def _block_event(line):
+    """'start' | 'end' | None aus einer getblock-DEX-Zeile ableiten."""
+    if "EA1" not in line:
+        return None
+    ea2 = ea1_code = None
+    for field in line.split("<BR>"):
+        field = field.strip()
+        if field.startswith("EA2*"):
+            ea2 = field
+        elif field.startswith("EA1*"):
+            parts = field.split("*")
+            if len(parts) > 1:
+                ea1_code = parts[1].upper()
+    if ea2:
+        if ea2.endswith("****1"):
+            return "start"
+        if ea2.endswith("****0"):
+            return "end"
+    if ea1_code:
+        if ea1_code.endswith("S"):
+            return "start"
+        if ea1_code.endswith("T"):
+            return "end"
+    return None
+
+
+def block_watchdog(line):
+    """Verarbeitet getblock-Zeilen (Tür auf/zu)."""
+    global block_since_ts, block_alert_sent, block_last_alert_ts
+    event = _block_event(line)
+    if not event:
+        return
+    now = time.time()
+    if event == "start":
+        if block_since_ts == 0.0:
+            block_since_ts = now
+            log("🚪 Tür/Blockade-Start erkannt")
+        return
+
+    # event == "end"
+    if block_since_ts == 0.0:
+        return
+    dur_min = int((now - block_since_ts) // 60)
+    if block_alert_sent:
+        telegram_send(
+            f"✅ <b>Tür zu – Automat wieder frei</b>\n"
+            f"⏱ Blockade dauerte ~{dur_min} Min"
+        )
+        log(f"✅ Blockade beendet ({dur_min} min)")
+    else:
+        log(f"ℹ️ Tür kurz offen ({dur_min} min) – kein Alarm")
+    block_since_ts = 0.0
+    block_alert_sent = False
+    block_last_alert_ts = 0.0
+
+
+def block_watchdog_tick():
+    """Prüft bei jeder Datenzeile, ob die Tür zu lange offen ist."""
+    global block_alert_sent, block_last_alert_ts
+    if block_since_ts == 0.0:
+        return
+    now = time.time()
+    dur_s = now - block_since_ts
+    if dur_s < BLOCK_ALERT_DELAY_S:
+        return
+    dur_min = int(dur_s // 60)
+    dur_txt = f"{dur_min // 60} h {dur_min % 60} min" if dur_min >= 60 else f"{dur_min} min"
+    start_txt = datetime.fromtimestamp(block_since_ts).strftime("%H:%M")
+    if not block_alert_sent:
+        block_alert_sent = True
+        block_last_alert_ts = now
+        telegram_send(
+            f"🚪 <b>Tür offen – Automat blockiert</b>\n"
+            f"⏱ Seit ~{dur_txt} (ab {start_txt} Uhr)\n"
+            f"ℹ️ Nimmt keine Bestellungen an\n"
+            f"🔧 Bitte Tür prüfen/schließen!"
+        )
+        log(f"🚪 Blockade-Alert: Tür seit ~{dur_txt} offen")
+    elif now - block_last_alert_ts >= BLOCK_REPEAT_INTERVAL_S:
+        block_last_alert_ts = now
+        telegram_send(
+            f"🔁 <b>Automat weiterhin blockiert</b>\n"
+            f"⏱ Tür seit ~{dur_txt} offen (ab {start_txt} Uhr)\n"
+            f"🔧 Bitte prüfen!"
+        )
+        log(f"🔁 Blockade-Alert wiederholt: ~{dur_txt}")
+
+
+def seed_block_state_from_log():
+    """Beim Listener-Start: letzten getblock-Event aus dem Rohlog übernehmen,
+    damit eine bereits offene Tür nicht übersehen wird."""
+    global block_since_ts
+    try:
+        with open(RAW_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 400_000))
+            tail = f.read().decode("latin1", errors="replace").splitlines()
+    except OSError:
+        return
+    last_evt = None
+    last_ts = None
+    for line in tail[-3000:]:
+        if "getblock" not in line:
+            continue
+        evt = _block_event(line)
+        if not evt:
+            continue
+        try:
+            last_ts = datetime.strptime(line[1:20], "%Y-%m-%d %H:%M:%S").timestamp()
+            last_evt = evt
+        except ValueError:
+            continue
+    if last_evt == "start" and last_ts:
+        block_since_ts = last_ts
+        log("🚪 Hinweis: Tür war beim Start bereits offen – Timer übernommen")
 
 
 def _get_today_total(db_path, today_prefix, current_amount_eur):
@@ -1168,6 +1311,8 @@ def listen_forever():
     state = {}  # Aktueller Zustand (wächst mit jedem neuen Datentyp)
     # Log-Rotation: raw_stream.log alle 24h oder >5MB rotieren
     rotate_log_if_needed()
+    # Tür-/Blockade-Zustand aus dem letzten Log-Eintrag übernehmen
+    seed_block_state_from_log()
     # Preise aus current_state.json laden (letzter Live-Stand)
     # Der Live-Listener speichert readprice-Befehle dort via save_state()
     state["prices"] = {}
