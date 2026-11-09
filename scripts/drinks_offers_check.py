@@ -55,12 +55,14 @@ def parse_offers(html):
         retailer = re.search(r"Händler:\s*\|\s*([^|]+)", txt)
         pack = re.search(r"(\d+)\s*[x×]\s*([\d,.]+)\s*(l|ml)\b", txt)
         single = re.search(r"(?:je|Je)\s*([\d,.]+)\s*(l|ml)\b", txt)
+        unit_p = re.search(r"€\s*([\d.,]+)\s*/\s*(l|kg)\b", txt)
         offers.append({
             "price": float(price.group(1).replace(".", "").replace(",", ".")),
             "valid": valid.group(1).strip() if valid else "",
             "retailer": (retailer.group(1).strip() if retailer else "?"),
             "pack": pack.groups() if pack else None,
             "single": single.groups() if single else None,
+            "unit": (unit_p.group(1), unit_p.group(2)) if unit_p else None,
             "text": txt,
         })
     return offers
@@ -87,6 +89,7 @@ def main():
     # Brand-Seiten cachen (mehrere Produkte pro Marke)
     cache = {}
     lines = []
+    groups = {}
     checked = 0
 
     for p in products:
@@ -101,6 +104,18 @@ def main():
         best = None
         for o in cache[slug]:
             n_units, ml = units_from_offer(o)
+            if (not n_units or not ml) and o.get("unit"):
+                # Fallback: Packungsgröße aus dem Grundpreis ableiten
+                # (z. B. 3,30 € bei 1,10 €/l → 3,0 l = 6 × 500 ml; 0,59 € bei 1,79 €/l → 0,33 l)
+                try:
+                    per_l = float(o["unit"][0].replace(".", "").replace(",", "."))
+                    total_ml = (o["price"] / per_l) * 1000
+                    ratio = total_ml / size_ml
+                    n_guess = round(ratio)
+                    if n_guess >= 1 and abs(total_ml - n_guess * size_ml) <= size_ml * 0.1:
+                        n_units, ml = n_guess, size_ml
+                except (ValueError, ZeroDivisionError):
+                    pass
             if not n_units or not ml:
                 continue
             # Größe muss zu unserer Packung passen (±5 % Toleranz)
@@ -114,16 +129,26 @@ def main():
             unit_price, o, n_units, ml = best
             target = p["target_price_eur"]
             ok = "✅" if unit_price <= target else "❌"
-            size_txt = f"{ml:.0f} ml" if abs(ml - 330) < 5 or abs(ml - 250) < 5 else f"{ml/1000:.2f} l"
+            size_txt = (f"{ml:.0f} ml" if abs(ml - 330) < 5 or abs(ml - 250) < 5
+                        else f"{ml/1000:.2f} l".replace(".", ","))
             pack_txt = f"{n_units}×{size_txt}" if n_units > 1 else size_txt
-            lines.append(
-                f"{p['name']} – {o['retailer']} – {unit_price:.2f} € ({pack_txt}) {ok} "
-                f"– {BASE}{slug}"
-            )
+            key = (slug, o["retailer"], round(unit_price, 2), pack_txt)
+            entry = groups.get(key)
+            if entry is None:
+                groups[key] = entry = {"names": [], "ok": ok, "pack": pack_txt}
+            entry["names"].append(p["name"])
+
+    for (slug, retailer, uprice, pack_txt), e in groups.items():
+        price_txt = f"{uprice:.2f}".replace(".", ",")
+        names = e["names"]
+        label = names[0] if len(names) == 1 else f"{names[0]} (+{len(names)-1} Sorten)"
+        lines.append(f"{label} – {retailer} – {price_txt} € ({pack_txt}) {e['ok']} – {BASE}{slug}")
 
     if lines:
-        print(f"🥤 *Wochenangebote* (Zielpreis-Check, brutto)")
-        print("\n".join(lines))
+        print("🥤 *Wochenangebote* (Zielpreis-Check, brutto)")
+        print("\n".join(lines[:12]))
+        if len(lines) > 12:
+            print(f"… und {len(lines)-12} weitere Treffer")
     else:
         print("Sonst keine passenden Angebote.")
 
