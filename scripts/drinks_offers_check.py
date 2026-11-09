@@ -145,7 +145,7 @@ def build_html(entries):
             f'<tr><td colspan="3" style="padding:18px 22px 6px;font:bold 15px Arial,sans-serif;'
             f'color:#111827;background:#f9fafb;">📍 {market}</td></tr>'
         )
-        for price, name, pack_txt, ok, slug in sorted(entries[market]):
+        for price, name, pack_txt, ok, slug, total, unitp in sorted(entries[market]):
             parts.append(
                 f'<tr>'
                 f'<td style="padding:9px 22px;border-bottom:1px solid #e5e7eb;font:14px Arial,sans-serif;">'
@@ -231,7 +231,7 @@ def main():
                     continue
                 up = o["price"] / n_units
                 if best is None or up < best[0]:
-                    best = (up, o, n_units, ml)
+                    best = (up, o, n_units, ml, o["price"])
                 break
 
         for mo in manual:
@@ -250,11 +250,11 @@ def main():
             n = int(mo.get("pack_count") or 1)
             up = float(mo["price_eur"]) / n
             if best is None or up < best[0]:
-                best = (up, {"retailer": mo["retailer"]}, n, mo_ml)
+                best = (up, {"retailer": mo["retailer"]}, n, mo_ml, float(mo["price_eur"]))
 
         if not best:
             continue
-        unit_price, o, n_units, ml = best
+        unit_price, o, n_units, ml, total_price = best
         ok = unit_price <= p["target_price_eur"]
         size_txt = (f"{ml:.0f} ml" if abs(ml - 330) < 5 or abs(ml - 250) < 5
                     else f"{ml/1000:.2f} l".replace(".", ","))
@@ -262,7 +262,8 @@ def main():
         key = (slug, o["retailer"], round(unit_price, 2), pack_txt)
         e = entries.get(key)
         if e is None:
-            entries[key] = e = {"names": [], "ok": ok}
+            entries[key] = e = {"names": [], "ok": ok, "total": total_price,
+                                "unit": unit_price, "n": n_units, "ml": ml}
         e["names"].append(p["name"])
 
     if not entries:
@@ -278,9 +279,10 @@ def main():
         label = names[0] if len(names) == 1 else f"{names[0]} (+{len(names)-1} Sorten)"
         ok = "✅" if e["ok"] else "❌"
         price_txt = f"{price:.2f}".replace(".", ",")
+        total_txt = f"{e['total']:.2f}".replace(".", ",")
         by_market_text[retailer].append(
-            (price, f"• {label} – {price_txt} € ({pack_txt}) {ok} – {BASE}{slug}"))
-        by_market_html[retailer].append((price, label, pack_txt, ok, slug))
+            (price, f"• {label} – {total_txt} € · {price_txt} €/Stk ({pack_txt}) {ok} – {BASE}{slug}"))
+        by_market_html[retailer].append((price, label, pack_txt, ok, slug, e["total"], price))
 
     out = ["🥤 Wochenangebote (nach Markt, brutto)"]
     shown = 0
