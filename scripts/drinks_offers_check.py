@@ -146,13 +146,15 @@ def build_html(entries):
             f'color:#111827;background:#f9fafb;">📍 {market}</td></tr>'
         )
         for price, name, pack_txt, ok, slug, total, unitp in sorted(entries[market]):
+            total_s = f"{total:.2f}".replace(".", ",")
+            unit_s = f"{unitp:.2f}".replace(".", ",")
             parts.append(
                 f'<tr>'
                 f'<td style="padding:9px 22px;border-bottom:1px solid #e5e7eb;font:14px Arial,sans-serif;">'
                 f'<a href="{BASE}{slug}" style="color:#1d4ed8;text-decoration:none;">{name}</a></td>'
                 f'<td style="padding:9px 10px;border-bottom:1px solid #e5e7eb;font:14px Arial,sans-serif;'
-                f'color:#111827;white-space:nowrap;"><b>{total:.2f}</b> € '
-                f'<span style="color:#6b7280;font-size:12px;">({pack_txt} · {unitp:.2f} €/Stk)</span></td>'
+                f'color:#111827;white-space:nowrap;"><b>{total_s}</b> € '
+                f'<span style="color:#6b7280;font-size:12px;">({pack_txt} · {unit_s} €/Stk)</span></td>'
                 f'<td style="padding:9px 22px;border-bottom:1px solid #e5e7eb;text-align:right;">{_badge(ok)}</td>'
                 f'</tr>'
             )
