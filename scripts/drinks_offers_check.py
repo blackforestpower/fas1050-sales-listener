@@ -86,7 +86,7 @@ def _pack_sizes(desc):
             size = float(mm.group(2).replace(",", "."))
         except ValueError:
             continue
-        if n <= 0 or size <= 0 or size > 100:
+        if n <= 0:
             continue
         unit = (mm.group(3) or "").lower()
         if unit.startswith("ml"):
@@ -95,6 +95,8 @@ def _pack_sizes(desc):
             ml = size * 1000
         else:
             ml = size * 1000 if size < 10 else size
+        if not (50 <= ml <= 5000):
+            continue
         packs.append((n, ml))
     # Einzelgrößen: "je 250 ml", "je 0,33-l-Dose", "0,5 l Dose"
     for mm in re.finditer(r"(?:je|Je)?\s*([\d,.]+)\s*(ml|l)(?![a-zA-Z])", desc):
@@ -102,9 +104,9 @@ def _pack_sizes(desc):
             size = float(mm.group(1).replace(",", "."))
         except ValueError:
             continue
-        if size <= 0 or size > 100:
-            continue
         ml = size if mm.group(2).lower() == "ml" else size * 1000
+        if not (50 <= ml <= 5000):
+            continue
         packs.append((1, ml))
     # Duplikate entfernen
     return list(dict.fromkeys(packs))
@@ -141,6 +143,32 @@ def _valid(valid_to, now):
         return datetime.fromisoformat(valid_to.replace("Z", "+00:00")) >= now
     except ValueError:
         return True
+
+
+def send_email(to_addr, subject, body):
+    """Sendet die Zusammenfassung per Gmail-SMTP (camirobot24)."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.header import Header
+
+    pw_file = "/root/.openclaw/workspace/secrets/gmail_app_password.txt"
+    try:
+        password = open(pw_file).read().strip()
+    except OSError:
+        return False
+    user = "camirobot24@gmail.com"
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = user
+    msg["To"] = to_addr
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+            server.login(user, password)
+            server.sendmail(user, [to_addr], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"# E-Mail-Fehler: {e}", file=sys.stderr)
+        return False
 
 
 def main():
@@ -220,15 +248,26 @@ def main():
         print("Sonst keine passenden Angebote.")
         return
 
-    print("🥤 *Wochenangebote* (nach Markt, brutto)")
+    out = ["🥤 Wochenangebote (nach Markt, brutto)"]
     shown = 0
     for market in sorted(by_market):
-        print(f"\n📍 *{market}*")
+        out.append(f"\n📍 {market}")
         for _, line in sorted(by_market[market]):
             if shown >= 16:
                 break
-            print(line)
+            out.append(line.replace("*", ""))
             shown += 1
+
+    report = "\n".join(out).replace("•", "•")
+    print(report)
+
+    # E-Mail-Versand (konfigurierbar)
+    mail = cfg.get("email") or {}
+    if mail.get("enabled"):
+        ok = send_email(mail.get("to", "info@camiro24.de"),
+                        mail.get("subject", "Wochenangebote"), report)
+        print(("\n📧 E-Mail gesendet an " + mail.get("to", "")) if ok
+              else "\n⚠️ E-Mail-Versand fehlgeschlagen", file=sys.stderr)
 
 
 if __name__ == "__main__":
