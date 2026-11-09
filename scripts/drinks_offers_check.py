@@ -138,17 +138,26 @@ def main():
                 groups[key] = entry = {"names": [], "ok": ok, "pack": pack_txt}
             entry["names"].append(p["name"])
 
+    from collections import defaultdict
+    by_market = defaultdict(list)
     for (slug, retailer, uprice, pack_txt), e in groups.items():
         price_txt = f"{uprice:.2f}".replace(".", ",")
         names = e["names"]
         label = names[0] if len(names) == 1 else f"{names[0]} (+{len(names)-1} Sorten)"
-        lines.append(f"{label} – {retailer} – {price_txt} € ({pack_txt}) {e['ok']} – {BASE}{slug}")
+        by_market[retailer].append(
+            (uprice, f"• {label} – {price_txt} € ({pack_txt}) {e['ok']} – {BASE}{slug}")
+        )
 
-    if lines:
-        print("🥤 *Wochenangebote* (Zielpreis-Check, brutto)")
-        print("\n".join(lines[:12]))
-        if len(lines) > 12:
-            print(f"… und {len(lines)-12} weitere Treffer")
+    if by_market:
+        print("🥤 *Wochenangebote* (nach Markt, brutto)")
+        shown = 0
+        for market in sorted(by_market):
+            print(f"\n📍 *{market}*")
+            for _, line in sorted(by_market[market]):
+                if shown >= 14:
+                    break
+                print(line)
+                shown += 1
     else:
         print("Sonst keine passenden Angebote.")
 
